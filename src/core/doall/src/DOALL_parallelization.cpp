@@ -95,7 +95,8 @@ bool DOALL::apply(LoopContent *LDI, Heuristics *h) {
     errs() << "DOALL:   Reduced variables:\n";
   }
   auto sccManager = LDI->getSCCManager();
-  auto isReducible =
+  auto isReducible = // DD: overall this just checks if the value "id" is part
+                     // of an IV SCC or not. True if it's not part of an IV SCC.
       [this, loopEnvironment, sccManager](uint32_t id, bool isLiveOut) -> bool {
     if (!isLiveOut) {
       return false;
@@ -108,8 +109,13 @@ bool DOALL::apply(LoopContent *LDI, Heuristics *h) {
      * IVs are not reducable because they get re-computed locally by each
      * thread.
      */
-    auto producer = loopEnvironment->getProducer(id);
-    auto scc = sccManager->getSCCDAG()->sccOfValue(producer);
+    auto producer = loopEnvironment->getProducer(
+        id); // DD: producers are one of two things: either a value live-in to
+             // the loop, or a value defined inside the loop which is used by a
+             // value outside the loop.
+    auto scc = sccManager->getSCCDAG()->sccOfValue(
+        producer); // DD: So, producer is just being used here as a shorthand to
+                   // grab the value corresp to the id
     auto sccInfo = sccManager->getSCCAttrs(scc);
     if (isa<InductionVariableSCC>(sccInfo)) {
 
@@ -140,7 +146,7 @@ bool DOALL::apply(LoopContent *LDI, Heuristics *h) {
     /*
      * We have a live-in variable.
      *
-     * We can avoid to propagate this live-in variable if its only purpose is to
+     * We can avoid propagating this live-in variable if its only purpose is to
      * propagate the initial value to a reduction variable. This is the case if
      * the following conditions are all met:
      * 1. This live-in variable only has one user within the loop, and
@@ -148,12 +154,15 @@ bool DOALL::apply(LoopContent *LDI, Heuristics *h) {
      * 3. The SCC that contains this PHI is a reduction variable.
      */
     auto producer = loopEnvironment->getProducer(id);
-    if (producer->getNumUses() == 1) {
+    if (producer->getNumUses()
+        == 1) { //??? isn't this wrong DD??? @simone see describing comment,
+                //algorithm mismatches //this is an overconservativeness.
       if (auto consumer = dyn_cast<PHINode>(*producer->user_begin())) {
         auto scc = sccManager->getSCCDAG()->sccOfValue(consumer);
         auto sccInfo = sccManager->getSCCAttrs(scc);
         if (isa<ReductionSCC>(sccInfo)) {
-          doallTask->addSkippedEnvironmentVariable(producer);
+          doallTask->addSkippedEnvironmentVariable(
+              producer); // DD: just tracks it as a skipped
           return true;
         }
       }
@@ -161,12 +170,18 @@ bool DOALL::apply(LoopContent *LDI, Heuristics *h) {
 
     return false;
   };
-  this->initializeEnvironmentBuilder(LDI, isReducible, isSkippable);
+  this->initializeEnvironmentBuilder(
+      LDI,
+      isReducible,
+      isSkippable); // DD: basically builds a wrapper for these args
+                    // DD: keep in mind the latter two args are lambdas
 
   /*
    * Clone loop into the single task used by DOALL
    */
-  this->cloneSequentialLoop(LDI, 0);
+  // DD: recall that tasks don't *refer* to parts of the CFG, they hold the code
+  // they work with internally and it's put there by being cloned.
+  this->cloneSequentialLoop(LDI, 0); // DD: does what the star comment says
   if (this->verbose >= Verbosity::Maximal) {
     errs() << "DOALL:  Cloned loop\n";
   }
@@ -174,7 +189,9 @@ bool DOALL::apply(LoopContent *LDI, Heuristics *h) {
   /*
    * Load all loop live-in values at the entry point of the task.
    */
-  auto envUser = this->envBuilder->getUser(0);
+  auto envUser = this->envBuilder->getUser(
+      0); // DD: what is a LoopEnvironmentUser for, exactly? Seems to be used
+          // identically to loopEnvironment
   assert(envUser != nullptr);
   for (auto envID : loopEnvironment->getEnvIDsOfLiveInVars()) {
     envUser->addLiveIn(envID);
@@ -182,7 +199,12 @@ bool DOALL::apply(LoopContent *LDI, Heuristics *h) {
   for (auto envID : loopEnvironment->getEnvIDsOfLiveOutVars()) {
     envUser->addLiveOut(envID);
   }
-  this->generateCodeToLoadLiveInVariables(LDI, 0);
+  this->generateCodeToLoadLiveInVariables(
+      LDI,
+      0); // DD: in the Task, for each live-in, generate code at the top of the
+          // Task which geps and then loads each live-in value.
+  // DD: obviously mem2reg can nuke this stuff later, so I assume it's done for
+  // utility during the transformation
 
   /*
    * This must follow loading live-ins as this re-wiring
@@ -192,12 +214,23 @@ bool DOALL::apply(LoopContent *LDI, Heuristics *h) {
   if (ltm->isOptimizationEnabled(LoopContentOptimization::MEMORY_CLONING_ID)) {
     this->cloneMemoryLocationsLocallyAndRewireLoop(LDI, 0);
   }
-  doallTask->adjustDataAndControlFlowToUseClones();
+  doallTask
+      ->adjustDataAndControlFlowToUseClones(); // DD: obviously replaces uses of
+                                               // live-ins to uses of the loads
+                                               // we shoved in just above
 
   /*
    * Handle the reduction variables.
    */
-  this->setReducableVariablesToBeginAtIdentityValue(LDI, 0);
+  this->setReducableVariablesToBeginAtIdentityValue(
+      LDI,
+      0); // DD: A reduction variable must be defined before we enter the loop
+          // (since if it were defined local to the loop, you couldn't
+          // accumulate data in it). Thus in the header there is a phi which
+          // either takes the value arriving from the preheader, or a value
+          // arriving from a latch. We change the preheader value to the
+          // identity value (where identity value is whatever val correctly
+          // "partially accumulates" the data, so 0 for +, 1 for *).
 
   /*
    * Add the jump to start the loop from within the task.
@@ -205,11 +238,14 @@ bool DOALL::apply(LoopContent *LDI, Heuristics *h) {
   auto headerClone = doallTask->getCloneOfOriginalBasicBlock(loopHeader);
   IRBuilder<> entryBuilder(doallTask->getEntry());
   entryBuilder.CreateBr(headerClone);
+  // DD: I'm gonna assume that we've got an entry block that holds e.g. the
+  // gep/loads of liveins, and now we're appending a branch to the header at the
+  // end of the entry block
 
   /*
    * Perform the iteration-chunking optimization
    */
-  this->rewireLoopToIterateChunks(LDI, doallTask);
+  this->rewireLoopToIterateChunks(LDI, doallTask); // DD: do chunking.
   if (this->verbose >= Verbosity::Maximal) {
     errs() << "DOALL:  Rewired induction variables and reducible variables\n";
   }

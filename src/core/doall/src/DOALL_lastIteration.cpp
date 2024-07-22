@@ -94,7 +94,12 @@ BasicBlock *DOALL::getBasicBlockExecutedOnlyByLastIterationBeforeExitingTask(
     auto &setOfLoopGoverningLastValues =
         this->IVValueJustBeforeEnteringBody.at(originalLoopGoverningPHI);
     assert(setOfLoopGoverningLastValues.size() > 0);
-    auto valueOfLoopGoverningIVAfterConsideringChunking =
+    auto valueOfLoopGoverningIVAfterConsideringChunking = // this ends up being
+                                                          // the select that we
+                                                          // built that chooses
+                                                          // chunkstepped IV or
+                                                          // not, see
+                                                          // chunking:129
         *setOfLoopGoverningLastValues.begin();
     assert(valueOfLoopGoverningIVAfterConsideringChunking != nullptr);
 

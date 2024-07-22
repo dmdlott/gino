@@ -32,8 +32,8 @@ DOALL::DOALL(Noelle &noelle)
   /*
    * Fetch the dispatcher to use to jump to a parallelized DOALL loop.
    */
-  this->taskDispatcher =
-      this->n.getProgram()->getFunction("NOELLE_DOALLDispatcher");
+  this->taskDispatcher = this->n.getProgram()->getFunction(
+      "NOELLE_DOALLDispatcher"); // DD Q: what is this for exactly?
   if (this->taskDispatcher == nullptr) {
     this->enabled = false;
     if (this->verbose != Verbosity::Disabled) {

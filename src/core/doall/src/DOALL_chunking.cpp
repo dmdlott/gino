@@ -24,10 +24,25 @@
 #include "arcana/noelle/core/SingleAccumulatorRecomputableSCC.hpp"
 #include "arcana/gino/core/DOALL.hpp"
 #include "arcana/gino/core/DOALLTask.hpp"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
 
 namespace arcana::gino {
 
 void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
+  // what is a task?
+  // A task is a wrapper of a set of insts S orged in BBs cloned from orig code,
+  // wrapped in a new function f, with an env e that includes live-in and
+  // live-out vars of S f is called task body
+  //  a task has a static unique id, but you can instantiate multiple instances
+  //  of the same task & each will have its own dynamic instance id
+  // task: define and then invoke.
+  // step 1: define signature (via FunctionType::get) of f, f needs to obtain as
+  // inputs everything it needs to execute, ergo an instance of e must be an
+  // input of f return type of f is void always when you instantiate a new task
+  // the body is first defined by creating two BB, entry and exit. new BB are
+  // then created by cloning S, and you do this via Task::cloneAndAddBasicBlocks
+  // (or similar func)
 
   /*
    * Fetch loop and IV information.
@@ -40,52 +55,119 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
   auto headerClone = task->getCloneOfOriginalBasicBlock(loopHeader);
   auto allIVInfo = LDI->getInductionVariableManager();
 
+  // Task 2
+  /*
+   * Collect clones of step size deriving values for all induction variables
+   * of the parallelized loop. DD: that is to say, the value which represents
+   * the final derivation of the step size. So the value can be treated as the
+   * step size.
+   */
+  IRBuilder<> entryBuilder(task->getEntry());
+  auto jumpEntry =
+      task->getEntry()->getTerminator(); // br from task-imposed entry block to
+                                         // actual loop header
+  entryBuilder.SetInsertPoint(jumpEntry);
+  auto clonedStepSizeMap =
+      this->cloneIVStepValueComputation(LDI, 0, entryBuilder);
+  // we need the original start val and end condition cmp val from the LGIV.
+  auto chunkComputationBB = task->newBasicBlock();
+  IRBuilder<> chunkCompBuilder(chunkComputationBB);
+  chunkCompBuilder.CreateBr(task->getEntry()->getUniqueSuccessor());
+  task->getEntry()->getTerminator()->setSuccessor(0, chunkComputationBB);
+  chunkCompBuilder.SetInsertPoint(chunkComputationBB->getTerminator());
+  // we can change chunksize arg in here with those. We'll also need the number
+  // of dynamic task instances but can get that directly.
+  auto lgivForChunkingVal = allIVInfo->getLoopGoverningInductionVariable();
+  auto endConVal = lgivForChunkingVal->getExitConditionValue();
+  auto endConValClone = this->fetchCloneInTask(task, endConVal);
+  auto lgivStartVal = lgivForChunkingVal->getInductionVariable()
+                          ->getLoopEntryPHI()
+                          ->getIncomingValueForBlock(
+                              loopPreHeader); // lgiv start val is the lgiv val
+                                              // in the preheader, nothing more
+  auto lgivStartClone = this->fetchCloneInTask(task, lgivStartVal);
+  auto stepOfLGIVForChunkSize =
+      clonedStepSizeMap.at(lgivForChunkingVal->getInductionVariable());
+  auto endMinusStart =
+      chunkCompBuilder.CreateSub(endConValClone, lgivStartClone);
+  auto N = chunkCompBuilder.CreateSRem(endMinusStart, stepOfLGIVForChunkSize);
+  // we have N, now, to get T we actually need to retrieve T from the arguments
+  // of the Task function, since we need T dynamically.
+  auto T = task->getTaskBody()->getArg(
+      2); // this should be correct. See DOALL_linker.cpp
+  auto NT = chunkCompBuilder.CreateSRem(
+      N,
+      T); // what if there's a remainder? Yaeaaaaaaaaaaaa that's not ok
+  auto chunkCounterType = NT->getType();
+  auto chunkSizeDD = chunkCompBuilder.CreateAdd(
+      NT,
+      ConstantInt::get(chunkCounterType,
+                       1)); // prevents issue with N/T having a remainder.
+
   /*
    * Generate PHI to track progress on the current chunk
    */
-  IRBuilder<> entryBuilder(task->getEntry());
-  auto jumpToLoop = task->getEntry()->getTerminator();
+  auto jumpToLoop =
+      task->getEntry()->getTerminator(); // br from task-imposed entry block to
+                                         // actual loop header
   entryBuilder.SetInsertPoint(jumpToLoop);
-  auto chunkCounterType = task->chunkSizeArg->getType();
-  auto chunkPHI = IVUtility::createChunkPHI(preheaderClone,
-                                            headerClone,
-                                            chunkCounterType,
-                                            task->chunkSizeArg);
-
-  /*
-   * Collect clones of step size deriving values for all induction variables
-   * of the parallelized loop.
-   */
-  auto clonedStepSizeMap =
-      this->cloneIVStepValueComputation(LDI, 0, entryBuilder);
+  auto chunkPHI = IVUtility::createChunkPHI(
+      preheaderClone, // so what this does is it dumps basically a "n = n + 1"
+                      // in the latch, and a "if n == CHUNKSIZE then set n = 0"
+      headerClone, // via a select in the latch + a phi in the header. So the
+                   // phi is 0 if CHUNKSIZE iterations have been done, or
+      chunkCounterType, // if it was reached from the preheader.
+      chunkSizeDD);
 
   /*
    * Determine start value of the IV for the task
    * The start value of an IV depends on the first iteration executed by a task.
    * This value, for a given task, is
-   *    = original_start + (original_step_size * task_instance_id * chunk_size)
+   *    = original_start + (original_step_size * chunk_size * task_instance_id)
    *
-   * where task_logical_id is the dynamic ID that spawn tasks will have, which
+   * where task_instance_id is the dynamic ID that spawn tasks will have, which
    * start at 0 (for the first task instance), 1 (for the second task instance),
    * until N-1 (for the last task instance).
    */
   for (auto ivInfo : allIVInfo->getInductionVariables(*loopSummary)) {
-    auto startOfIV = this->fetchCloneInTask(task, ivInfo->getStartValue());
-    auto stepOfIV = clonedStepSizeMap.at(ivInfo);
-    auto loopEntryPHI = ivInfo->getLoopEntryPHI();
-    auto ivPHI = cast<PHINode>(this->fetchCloneInTask(task, loopEntryPHI));
+    auto startOfIV = this->fetchCloneInTask(
+        task,
+        ivInfo->getStartValue()); // DD: I assume this literally gets the LLVM
+                                  // value that the IV starts at
+    auto stepOfIV =
+        clonedStepSizeMap.at(ivInfo); // per earlier this is the cloned LLVM
+                                      // value that is the step size
+    auto loopEntryPHI =
+        ivInfo->getLoopEntryPHI(); // this must exist else the IV would be a
+                                   // value local to the loop. Since it must be
+                                   // initialized somewhere, that can't be true
+                                   // -- at most there can be a phi of (0, val)
+                                   // at the header, e.g.
+    auto ivPHI = cast<PHINode>(this->fetchCloneInTask(
+        task,
+        loopEntryPHI)); // get the clone of the loopEntryPhi
 
-    auto nthCoreOffset = IVUtility::scaleInductionVariableStep(
-        preheaderClone,
-        ivPHI,
-        stepOfIV,
-        entryBuilder.CreateMul(task->taskInstanceID,
-                               task->chunkSizeArg,
-                               "coreIdx_X_chunkSize"));
+    auto nthCoreOffset =
+        IVUtility::scaleInductionVariableStep( // inserts insts which calc the
+                                               // offset for core N of the start
+                                               // val basically per the opening
+                                               // comment of this section
+            preheaderClone,
+            ivPHI,
+            stepOfIV,
+            entryBuilder.CreateMul(task->taskInstanceID,
+                                   chunkSizeDD,
+                                   "coreIdx_X_chunkSize"));
 
     auto offsetStartValue =
-        IVUtility::offsetIVPHI(preheaderClone, ivPHI, startOfIV, nthCoreOffset);
-    ivPHI->setIncomingValueForBlock(preheaderClone, offsetStartValue);
+        IVUtility::offsetIVPHI(preheaderClone,
+                               ivPHI,
+                               startOfIV,
+                               nthCoreOffset); // apply the previous
+    ivPHI->setIncomingValueForBlock(
+        preheaderClone,
+        offsetStartValue); // alter the (clone of) loopEntryPhi to have the
+                           // correct start val for the task.
   }
 
   /*
@@ -98,8 +180,14 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
    */
   for (auto ivInfo : allIVInfo->getInductionVariables(*loopSummary)) {
     auto stepOfIV = clonedStepSizeMap.at(ivInfo);
-    auto cloneLoopEntryPHI =
-        this->fetchCloneInTask(task, ivInfo->getLoopEntryPHI());
+    auto cloneLoopEntryPHI = this->fetchCloneInTask(
+        task,
+        ivInfo->getLoopEntryPHI()); // fetch the cloned loop entry phi, per IV.
+                                    // So there's one cloned LEPHI per IV. This
+                                    // makes sense because ince it must be
+                                    // initialized somewhere, that can't be true
+                                    // -- at most there can be a phi of (0, val)
+                                    // at the header, e.g.
     assert(cloneLoopEntryPHI != nullptr);
     auto ivPHI = cast<PHINode>(cloneLoopEntryPHI);
     auto onesValueForChunking = ConstantInt::get(chunkCounterType, 1);
@@ -107,12 +195,21 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
         preheaderClone,
         ivPHI,
         stepOfIV,
-        entryBuilder.CreateMul(entryBuilder.CreateSub(task->numTaskInstances,
-                                                      onesValueForChunking,
-                                                      "numCoresMinus1"),
-                               task->chunkSizeArg,
-                               "numCoresMinus1_X_chunkSize"));
+        entryBuilder.CreateMul(
+            entryBuilder.CreateSub(task->numTaskInstances,
+                                   onesValueForChunking,
+                                   "numCoresMinus1"),
+            chunkSizeDD,
+            "numCoresMinus1_X_chunkSize")); // build a multiply between
+                                            // (N-1)(sizeof(chunk)) where N
+                                            // number of cores.
 
+    // so what this does is, it constructs a selectinst where the condition is
+    // whether the chunk is finished, if chunk is finished the selectinst adds
+    // chunksize to the IV's value and outputs the result, if chunk is NOT
+    // finished the selectinst outputs the IV's existing value. The select is
+    // placed ahead of the terminator of the BB containing ivPHI. So, that's
+    // whatever BB loopentryphi is in...
     auto chunkedIVValues = IVUtility::chunkInductionVariablePHI(preheaderClone,
                                                                 ivPHI,
                                                                 chunkPHI,
@@ -145,19 +242,36 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
     }
 
     /*
-     * Retrieve the relevant values of the periodic variable SCC.
+     * Retrieve the relevant Values for the periodic variable SCC.
      */
     auto initialValue = periodicVariableSCC->getInitialValue();
-    auto period = periodicVariableSCC->getPeriod();
-    auto step = periodicVariableSCC->getStepValue();
+    auto period = periodicVariableSCC
+                      ->getPeriod(); // period is necessarily an actual value,
+                                     // otherwise it can't be computed with
+    auto step =
+        periodicVariableSCC
+            ->getStepValue(); // period is the modulo vs step is the delta
     auto phi =
-        periodicVariableSCC->getPhiThatAccumulatesValuesBetweenLoopIterations();
+        periodicVariableSCC
+            ->getPhiThatAccumulatesValuesBetweenLoopIterations(); // SingleAccumulatorRecomputableSCC
+                                                                  // have a
+                                                                  // single
+                                                                  // PHInode.
+                                                                  // periodicVariableSCC
+                                                                  // ->
+                                                                  // SingleAccumulatorRecomputableSCC,
+                                                                  // and this is
+                                                                  // the
+                                                                  // phinode.
     assert(
         phi->getNumIncomingValues() == 2
-        && "DOALL: PHINode in periodic variable SCC doesn't have exactly two entries!");
-    auto taskPHI = cast<PHINode>(task->getCloneOfOriginalInstruction(phi));
+        && "DOALL: PHINode in periodic variable SCC doesn't have exactly two entries!"); // so this is here, I'm guessing, because we don't like the notion of a periodicVariableSCC inside a loop that has more than one latch.
+    auto taskPHI = cast<PHINode>(task->getCloneOfOriginalInstruction(
+        phi)); // get the task's clone of the previous
 
     unsigned entryBlock, loopBlock;
+    // check which index of the phi is the entry block and which is the loop
+    // block.
     if (phi->getIncomingValue(0) == initialValue) {
       entryBlock = 0;
       loopBlock = 1;
@@ -167,11 +281,13 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
       entryBlock = 1;
       loopBlock = 0;
     }
-    auto taskLoopBlock =
-        task->getCloneOfOriginalBasicBlock(phi->getIncomingBlock(loopBlock));
-    auto loopValue = phi->getIncomingValue(loopBlock);
-    auto taskLoopValue =
-        task->getCloneOfOriginalInstruction(cast<Instruction>(loopValue));
+    auto taskLoopBlock = task->getCloneOfOriginalBasicBlock(
+        phi->getIncomingBlock(loopBlock)); // latch.
+    auto loopValue =
+        phi->getIncomingValue(loopBlock); // the value assigned to phi if phi is
+                                          // reached from inside loop
+    auto taskLoopValue = task->getCloneOfOriginalInstruction(
+        cast<Instruction>(loopValue)); // clone of previous
 
     /*
      * Calculate the periodic variable's initial value for the task.
@@ -179,19 +295,29 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
      * period)
      */
     auto coreIDxChunkSize = entryBuilder.CreateMul(task->taskInstanceID,
-                                                   task->chunkSizeArg,
+                                                   chunkSizeDD,
                                                    "coreIdx_X_chunkSize");
-    auto numSteps =
-        entryBuilder.CreateSRem(coreIDxChunkSize, period, "numSteps");
-    auto numStepsTrunc = entryBuilder.CreateTrunc(numSteps, step->getType());
-    auto numStepsxStepSize =
-        entryBuilder.CreateMul(step, numStepsTrunc, "stepSize_X_numSteps");
+    auto numSteps = entryBuilder.CreateSRem(
+        coreIDxChunkSize,
+        period,
+        "numSteps"); // size of chunk module period produces step difference
+    auto numStepsTrunc = entryBuilder.CreateTrunc(
+        numSteps,
+        step->getType()); // presumably handles oversize periods or something
+    auto numStepsxStepSize = entryBuilder.CreateMul(
+        step,
+        numStepsTrunc,
+        "stepSize_X_numSteps"); // per name, but num steps is again chunk module
+                                // period
     auto numStepsxStepSizeTrunc =
         entryBuilder.CreateTrunc(numStepsxStepSize, initialValue->getType());
     auto chunkInitialValue = entryBuilder.CreateAdd(initialValue,
                                                     numStepsxStepSizeTrunc,
                                                     "initialValuePlusStep");
-    taskPHI->setIncomingValue(entryBlock, chunkInitialValue);
+    taskPHI->setIncomingValue(
+        entryBlock,
+        chunkInitialValue); // alter the phi at the top of the loop so that the
+                            // initial val is the thing we compute here
 
     /*
      * Determine value of the start of this core's next chunk
@@ -204,19 +330,30 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
                                                  onesValueForChunking,
                                                  "numCoresMinus1");
     auto chunkStepSize = entryBuilder.CreateMul(numCoresMinus1,
-                                                task->chunkSizeArg,
+                                                chunkSizeDD,
                                                 "numCoresMinus1_X_chunkSize");
-    auto chunkStepSizeTrunc =
-        entryBuilder.CreateTrunc(chunkStepSize, step->getType());
-    auto chunkStep =
-        entryBuilder.CreateMul(chunkStepSizeTrunc, step, "chunkStep");
+    auto chunkStepSizeTrunc = entryBuilder.CreateTrunc(
+        chunkStepSize,
+        step->getType()); // why? Might be just a typing thing but can you fuck
+                          // up the modulo with this?
+    auto chunkStep = entryBuilder.CreateMul(
+        chunkStepSizeTrunc,
+        step,
+        "chunkStep"); // Note that we shoved all this computation in the entry
+                      // block, so it only runs once
 
     /*
      * Add the instructions for the calculation of the next chunk's start value
      * in the loop's body.
      */
-    IRBuilder<> loopBuilder(taskLoopBlock);
-    loopBuilder.SetInsertPoint(taskLoopBlock->getTerminator());
+    IRBuilder<> loopBuilder(
+        taskLoopBlock); // recall that taskLoopBlock is the latch
+    loopBuilder.SetInsertPoint(
+        taskLoopBlock
+            ->getTerminator()); // So we're at the bottom of the iteration which
+                                // is why we're in the latch, and we have to be
+                                // there because we've gotta be before the
+                                // superstep into the next set of iterations.
     auto chunkStepTrunc =
         loopBuilder.CreateTrunc(chunkStep, taskLoopValue->getType());
     auto nextChunkValueBeforeMod =
@@ -225,9 +362,11 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
                               "nextChunkValueBeforeMod");
     auto periodTrunc =
         loopBuilder.CreateTrunc(period, taskLoopValue->getType());
-    auto nextChunkValue = loopBuilder.CreateSRem(nextChunkValueBeforeMod,
-                                                 periodTrunc,
-                                                 "nextChunkValue");
+    auto nextChunkValue = loopBuilder.CreateSRem(
+        nextChunkValueBeforeMod,
+        periodTrunc,
+        "nextChunkValue"); // srem: signed division. Modulo stand-in. Should it
+                           // be UREM @simone?
 
     /*
      * Determine if we have reached the end of the chunk, and choose the
@@ -235,11 +374,14 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
      */
     auto isChunkCompleted =
         cast<SelectInst>(chunkPHI->getIncomingValueForBlock(taskLoopBlock))
-            ->getCondition();
-    auto nextValue = loopBuilder.CreateSelect(isChunkCompleted,
-                                              nextChunkValue,
-                                              taskLoopValue,
-                                              "nextValue");
+            ->getCondition(); // sure, literally build a select inst where
+                              // condition is "isChunkCompleted" and return is
+                              // nextChunkValue or the extant taskLoopValue
+    auto nextValue = loopBuilder.CreateSelect(
+        isChunkCompleted, // still inserting into the latch
+        nextChunkValue,
+        taskLoopValue,
+        "nextValue");
     taskPHI->setIncomingValueForBlock(taskLoopBlock, nextValue);
   }
 
@@ -288,8 +430,12 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
 
       if (auto clonePHI = dyn_cast<PHINode>(cloneI)) {
         auto usedValue = clonePHI->getIncomingValue(0);
-        clonePHI->replaceAllUsesWith(usedValue);
-        clonePHI->eraseFromParent();
+        clonePHI->replaceAllUsesWith(
+            usedValue); // DD: the legality of these ops is guaranteed by
+                        // invariantManager->isLoopInvariant
+        clonePHI
+            ->eraseFromParent(); // DD: come to think of it, isLoopInvariant
+                                 // proly relies on "phi has only 1 val" or smth
         cloneI = dyn_cast<Instruction>(usedValue);
         if (!cloneI) {
           continue;
@@ -297,11 +443,12 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
       }
 
       cloneI->removeFromParent();
-      entryBuilder.Insert(cloneI);
+      entryBuilder.Insert(cloneI); // move to entry
     }
 
     exitConditionInst->removeFromParent();
     entryBuilder.Insert(exitConditionInst);
+    // DD: overall this really just does what the parent comment says
   }
 
   /*
@@ -332,7 +479,9 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
   std::unordered_set<Instruction *> reducibleHeaderPHIsWithHeaderLogic;
 
   /*
-   * Collect (1) by iterating the InductionVariableManager
+   * Collect IV instructions, including the comparison
+   * and branch of the loop governing IV by iterating the
+   * InductionVariableManager
    */
   for (auto ivInfo : allIVInfo->getInductionVariables(*loopSummary)) {
     for (auto I : ivInfo->getAllInstructions()) {
@@ -343,12 +492,12 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
   repeatableInstructions.insert(brInst);
 
   /*
-   * Collect (2)
+   * Collect The PHI used to chunk iterations
    */
   repeatableInstructions.insert(chunkPHI);
 
   /*
-   * Collect (3) by identifying all reducible SCCs
+   * Collect Any PHIs of reducible variables by identifying all reducible SCCs
    */
   auto nonDOALLSCCs = sccManager->getSCCsWithLoopCarriedDataDependencies();
   for (auto sccInfo : nonDOALLSCCs) {
@@ -380,8 +529,9 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
   }
 
   /*
-   * Collect (4) by identifying header instructions belonging to independent
-   * SCCs that are loop invariant
+   * Collect any loop invariant instructions that belong to
+   * independent-execution SCCs by identifying header instructions belonging to
+   * independent SCCs that are loop invariant
    */
   for (auto &I : *loopHeader) {
     auto scc = sccdag->sccOfValue(&I);
@@ -453,7 +603,7 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
      * to use the right value depending on whether the header would NOT have
      * executed its last iteration. If that is the case, then we need to use the
      * PHI instruction. Otherwise, if the last instance of the header was meant
-     * to be executed, then we need to use the non-PHI instruction.
+     * to be executed, then we need to use the non-PHI instruction.fd
      *
      * To solve this problem, we are going to inject a new SelectInst that
      * checks whether the last execution of the header was meant to be executed.
@@ -514,11 +664,17 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
           this->fetchCloneInTask(task, loopGoverningIV->getStartValue());
 
       /*
+       * If this comment gets its spacing normalized, it won't read right.
+       * Reminder: must use non-phi iff header was meant to execute its last
+       * iteration.
+       *
        * Piece together the condition for all the SelectInst:
        * ((prev loop-governing IV's value triggered exiting the loop) && (IV
+       * //DD: using "prev LGIV value" at any point is sacriledge. In this case
+       * it seems to mean "n-1" but I intially took it to mean "n-chunkstep-1"
        * header PHI != start value)) ? header phi // this will contain the
-       * pre-header value or the previous latch value : original producer //
-       * this will be the live out value from the header
+       * pre-header value or the previous latch value : original producer //this
+       * will be the live out value from the header
        */
       IRBuilder<> exitBuilder(
           task->getLastBlock(0)->getFirstNonPHIOrDbgOrLifetime());
@@ -644,9 +800,12 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
         valueUsedToCompareAgainstExitConditionValue,
         prevIterationValue);
     latchBuilder.Insert(clonedCmpInst);
-    latchBuilder.CreateCondBr(clonedCmpInst,
-                              task->getLastBlock(0),
-                              headerClone);
+    latchBuilder.CreateCondBr(
+        clonedCmpInst,
+        task->getLastBlock(0),
+        headerClone); // the big lesson here is that if iteration n-1 is final,
+                      // we can't execute the header again. But if n is the
+                      // final we MUST execute the header again.
   }
 
   /*
