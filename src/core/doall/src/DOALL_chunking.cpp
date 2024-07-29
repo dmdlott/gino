@@ -24,8 +24,10 @@
 #include "arcana/noelle/core/SingleAccumulatorRecomputableSCC.hpp"
 #include "arcana/gino/core/DOALL.hpp"
 #include "arcana/gino/core/DOALLTask.hpp"
+#include "arcana/noelle/core/Utils.hpp"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Value.h"
 
 namespace arcana::gino {
 
@@ -62,22 +64,29 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
    * the final derivation of the step size. So the value can be treated as the
    * step size.
    */
+  IRBuilder<> chunkSizeBuilder(task->getEntry());
   IRBuilder<> entryBuilder(task->getEntry());
+  Instruction *firstChunkSizeInst = nullptr;
   auto jumpEntry =
       task->getEntry()->getTerminator(); // br from task-imposed entry block to
                                          // actual loop header
-  entryBuilder.SetInsertPoint(jumpEntry);
+  chunkSizeBuilder.SetInsertPoint(jumpEntry);
+
   auto clonedStepSizeMap =
-      this->cloneIVStepValueComputation(LDI, 0, entryBuilder);
+      this->cloneIVStepValueComputation(LDI, 0, chunkSizeBuilder);
   // we need the original start val and end condition cmp val from the LGIV.
-  auto chunkComputationBB = task->newBasicBlock();
-  IRBuilder<> chunkCompBuilder(chunkComputationBB);
-  chunkCompBuilder.CreateBr(task->getEntry()->getUniqueSuccessor());
-  task->getEntry()->getTerminator()->setSuccessor(0, chunkComputationBB);
-  chunkCompBuilder.SetInsertPoint(chunkComputationBB->getTerminator());
+  // IRBuilder<> entryBuilder(chunkComputationBB);
+
+  // entryBuilder.CreateBr(task->getEntry()->getUniqueSuccessor());
+  // task->getEntry()->getTerminator()->setSuccessor(0, chunkComputationBB);
+  // entryBuilder.SetInsertPoint(chunkComputationBB->getTerminator());
+  // chunkPHI->replaceIncomingBlockWith(task->getEntry(), chunkComputationBB);
+  // //deleteme
+
   // we can change chunksize arg in here with those. We'll also need the number
   // of dynamic task instances but can get that directly.
   auto lgivForChunkingVal = allIVInfo->getLoopGoverningInductionVariable();
+  auto typeOfLGIV = lgivForChunkingVal->getInductionVariable()->getType();
   auto endConVal = lgivForChunkingVal->getExitConditionValue();
   auto endConValClone = this->fetchCloneInTask(task, endConVal);
   auto lgivStartVal = lgivForChunkingVal->getInductionVariable()
@@ -88,36 +97,71 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
   auto lgivStartClone = this->fetchCloneInTask(task, lgivStartVal);
   auto stepOfLGIVForChunkSize =
       clonedStepSizeMap.at(lgivForChunkingVal->getInductionVariable());
-  auto endMinusStart =
-      chunkCompBuilder.CreateSub(endConValClone, lgivStartClone);
-  auto N = chunkCompBuilder.CreateSRem(endMinusStart, stepOfLGIVForChunkSize);
+  assert(lgivStartClone && "No lgiv start value??");
+  assert(endConValClone && "No end con val??");
+  auto endMinusStart = chunkSizeBuilder.CreateSub(endConValClone,
+                                                  lgivStartClone,
+                                                  "endMinusStart");
+  firstChunkSizeInst = dyn_cast<Instruction>(endMinusStart);
+  auto N = chunkSizeBuilder.CreateSDiv(endMinusStart, stepOfLGIVForChunkSize);
+  if (!firstChunkSizeInst) {
+    firstChunkSizeInst = dyn_cast<Instruction>(N);
+  }
   // we have N, now, to get T we actually need to retrieve T from the arguments
   // of the Task function, since we need T dynamically.
   auto T = task->getTaskBody()->getArg(
       2); // this should be correct. See DOALL_linker.cpp
-  auto NT = chunkCompBuilder.CreateSRem(
+  Value *usedT;
+  if (T->getType() != typeOfLGIV) {
+    usedT = chunkSizeBuilder.CreateTrunc(T, N->getType());
+    if (!firstChunkSizeInst) {
+      firstChunkSizeInst = dyn_cast<Instruction>(usedT);
+    }
+  } else {
+    usedT = T;
+  }
+  // auto Ttrunc = entryBuilder.CreateTrunc(T, N->getType());
+  auto NT = chunkSizeBuilder.CreateSDiv(
       N,
-      T); // what if there's a remainder? Yaeaaaaaaaaaaaa that's not ok
-  auto chunkCounterType = NT->getType();
-  auto chunkSizeDD = chunkCompBuilder.CreateAdd(
+      usedT); // what if there's a remainder? Yaeaaaaaaaaaaaa that's not ok
+  if (!firstChunkSizeInst) {
+    firstChunkSizeInst = dyn_cast<Instruction>(NT);
+  }
+  auto chunkSizeDD = chunkSizeBuilder.CreateAdd(
       NT,
-      ConstantInt::get(chunkCounterType,
+      ConstantInt::get(NT->getType(),
                        1)); // prevents issue with N/T having a remainder.
+  if (!firstChunkSizeInst) {
+    firstChunkSizeInst = dyn_cast<Instruction>(chunkSizeDD);
+  }
+  Value *usedChunkSize;
+  if (chunkSizeDD->getType() != task->taskInstanceID->getType()) {
+    usedChunkSize =
+        chunkSizeBuilder.CreateZExt(chunkSizeDD,
+                                    task->taskInstanceID->getType());
+  } else {
+    usedChunkSize = chunkSizeDD;
+  }
+  auto chunkCounterType = usedChunkSize->getType();
 
   /*
    * Generate PHI to track progress on the current chunk
    */
   auto jumpToLoop =
       task->getEntry()->getTerminator(); // br from task-imposed entry block to
-                                         // actual loop header
-  entryBuilder.SetInsertPoint(jumpToLoop);
-  auto chunkPHI = IVUtility::createChunkPHI(
+                                         // actual loop preheader
+  // Task 2
+  /*auto chunkPHI = IVUtility::createChunkPHI(
       preheaderClone, // so what this does is it dumps basically a "n = n + 1"
                       // in the latch, and a "if n == CHUNKSIZE then set n = 0"
       headerClone, // via a select in the latch + a phi in the header. So the
                    // phi is 0 if CHUNKSIZE iterations have been done, or
       chunkCounterType, // if it was reached from the preheader.
-      chunkSizeDD);
+      usedChunkSize);
+  */
+
+  entryBuilder.SetInsertPoint(jumpEntry);
+  // entryBuilder.SetInsertPoint((Instruction*) endMinusStart);
 
   /*
    * Determine start value of the IV for the task
@@ -129,6 +173,8 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
    * start at 0 (for the first task instance), 1 (for the second task instance),
    * until N-1 (for the last task instance).
    */
+  // task 2: we keep this
+  Value *lgivEndVal; // Task 2
   for (auto ivInfo : allIVInfo->getInductionVariables(*loopSummary)) {
     auto startOfIV = this->fetchCloneInTask(
         task,
@@ -156,7 +202,7 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
             ivPHI,
             stepOfIV,
             entryBuilder.CreateMul(task->taskInstanceID,
-                                   chunkSizeDD,
+                                   usedChunkSize,
                                    "coreIdx_X_chunkSize"));
 
     auto offsetStartValue =
@@ -168,6 +214,53 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
         preheaderClone,
         offsetStartValue); // alter the (clone of) loopEntryPhi to have the
                            // correct start val for the task.
+    // Task 2: we should calculate an lgiv end value based on each chunk.
+    if (ivInfo
+        == allIVInfo->getLoopGoverningInductionVariable()
+               ->getInductionVariable()) {
+      if (offsetStartValue->getType() != usedChunkSize->getType()) {
+        auto truncOffChunkSize =
+            entryBuilder.CreateTrunc(usedChunkSize,
+                                     offsetStartValue->getType());
+        auto lgivEndValTemp = entryBuilder.CreateAdd(truncOffChunkSize,
+                                                     offsetStartValue,
+                                                     "lgivEndValTemp");
+        auto lgivEndValFin = entryBuilder.CreateSub(lgivEndValTemp,
+                                                    clonedStepSizeMap[ivInfo],
+                                                    "lgivEndValFin");
+        lgivEndVal = lgivEndValFin;
+      } else {
+        auto lgivEndValTemp = entryBuilder.CreateAdd(offsetStartValue,
+                                                     usedChunkSize,
+                                                     "lgivEndValTemp");
+        auto lgivEndValFin = entryBuilder.CreateSub(lgivEndValTemp,
+                                                    clonedStepSizeMap[ivInfo],
+                                                    "lgivEndValFin");
+        lgivEndVal = lgivEndValFin;
+      }
+    }
+  }
+
+  /*
+   * Remove the old terminator because it will replace with the check.
+   */
+
+  for (auto latch : loopSummary->getLatches()) {
+    auto cloneLatch = task->getCloneOfOriginalBasicBlock(latch);
+    auto latchTerminator = cloneLatch->getTerminator();
+    latchTerminator->eraseFromParent();
+    IRBuilder<> latchBuilder(cloneLatch);
+    auto lgivPHI = allIVInfo->getLoopGoverningInductionVariable(*loopSummary)
+                       ->getInductionVariable()
+                       ->getLoopEntryPHI();
+    auto lgivPHIClone = this->fetchCloneInTask(task, lgivPHI);
+    auto chunkDoneCheck = latchBuilder.CreateCmp(CmpInst::ICMP_EQ,
+                                                 lgivEndVal,
+                                                 lgivPHIClone,
+                                                 "chunkDoneCheck");
+    latchBuilder.CreateCondBr(chunkDoneCheck,
+                              task->getLastBlock(0),
+                              headerClone);
   }
 
   /*
@@ -199,7 +292,7 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
             entryBuilder.CreateSub(task->numTaskInstances,
                                    onesValueForChunking,
                                    "numCoresMinus1"),
-            chunkSizeDD,
+            usedChunkSize,
             "numCoresMinus1_X_chunkSize")); // build a multiply between
                                             // (N-1)(sizeof(chunk)) where N
                                             // number of cores.
@@ -210,13 +303,16 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
     // finished the selectinst outputs the IV's existing value. The select is
     // placed ahead of the terminator of the BB containing ivPHI. So, that's
     // whatever BB loopentryphi is in...
+    // task 2:
+    /*
     auto chunkedIVValues = IVUtility::chunkInductionVariablePHI(preheaderClone,
                                                                 ivPHI,
                                                                 chunkPHI,
                                                                 chunkStepSize);
     this->IVValueJustBeforeEnteringBody[ivPHI] = chunkedIVValues;
+    */
   }
-
+  entryBuilder.SetInsertPoint(jumpEntry);
   /*
    * Fetch the SCCDAG of the loop.
    */
@@ -295,7 +391,7 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
      * period)
      */
     auto coreIDxChunkSize = entryBuilder.CreateMul(task->taskInstanceID,
-                                                   chunkSizeDD,
+                                                   usedChunkSize,
                                                    "coreIdx_X_chunkSize");
     auto numSteps = entryBuilder.CreateSRem(
         coreIDxChunkSize,
@@ -319,75 +415,78 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
         chunkInitialValue); // alter the phi at the top of the loop so that the
                             // initial val is the thing we compute here
 
-    /*
-     * Determine value of the start of this core's next chunk
-     * from the beginning of the next core's chunk.
-     * Formula: (next_chunk_initialValue + (step_size * (num_cores - 1) *
-     * chunk_size)) % period
-     */
-    auto onesValueForChunking = ConstantInt::get(chunkCounterType, 1);
-    auto numCoresMinus1 = entryBuilder.CreateSub(task->numTaskInstances,
-                                                 onesValueForChunking,
-                                                 "numCoresMinus1");
-    auto chunkStepSize = entryBuilder.CreateMul(numCoresMinus1,
-                                                chunkSizeDD,
-                                                "numCoresMinus1_X_chunkSize");
-    auto chunkStepSizeTrunc = entryBuilder.CreateTrunc(
-        chunkStepSize,
-        step->getType()); // why? Might be just a typing thing but can you fuck
-                          // up the modulo with this?
-    auto chunkStep = entryBuilder.CreateMul(
-        chunkStepSizeTrunc,
-        step,
-        "chunkStep"); // Note that we shoved all this computation in the entry
-                      // block, so it only runs once
-
-    /*
-     * Add the instructions for the calculation of the next chunk's start value
-     * in the loop's body.
-     */
-    IRBuilder<> loopBuilder(
-        taskLoopBlock); // recall that taskLoopBlock is the latch
-    loopBuilder.SetInsertPoint(
-        taskLoopBlock
-            ->getTerminator()); // So we're at the bottom of the iteration which
-                                // is why we're in the latch, and we have to be
-                                // there because we've gotta be before the
-                                // superstep into the next set of iterations.
-    auto chunkStepTrunc =
-        loopBuilder.CreateTrunc(chunkStep, taskLoopValue->getType());
-    auto nextChunkValueBeforeMod =
-        loopBuilder.CreateAdd(taskLoopValue,
-                              chunkStepTrunc,
-                              "nextChunkValueBeforeMod");
-    auto periodTrunc =
-        loopBuilder.CreateTrunc(period, taskLoopValue->getType());
-    auto nextChunkValue = loopBuilder.CreateSRem(
-        nextChunkValueBeforeMod,
-        periodTrunc,
-        "nextChunkValue"); // srem: signed division. Modulo stand-in. Should it
-                           // be UREM @simone?
-
-    /*
-     * Determine if we have reached the end of the chunk, and choose the
-     * periodic variable's next value accordingly.
-     */
-    auto isChunkCompleted =
-        cast<SelectInst>(chunkPHI->getIncomingValueForBlock(taskLoopBlock))
-            ->getCondition(); // sure, literally build a select inst where
-                              // condition is "isChunkCompleted" and return is
-                              // nextChunkValue or the extant taskLoopValue
-    auto nextValue = loopBuilder.CreateSelect(
-        isChunkCompleted, // still inserting into the latch
-        nextChunkValue,
-        taskLoopValue,
-        "nextValue");
-    taskPHI->setIncomingValueForBlock(taskLoopBlock, nextValue);
-  }
+  } // task 2
 
   /*
-   * The exit condition needs to be made non-strict to catch iterating past it
-   */
+  /
+   * Determine value of the start of this core's next chunk
+   * from the beginning of the next core's chunk.
+   * Formula: (next_chunk_initialValue + (step_size * (num_cores - 1) *
+   * chunk_size)) % period
+   /
+  auto onesValueForChunking = ConstantInt::get(chunkCounterType, 1);
+  auto numCoresMinus1 = entryBuilder.CreateSub(task->numTaskInstances,
+                                               onesValueForChunking,
+                                               "numCoresMinus1");
+  auto chunkStepSize = entryBuilder.CreateMul(numCoresMinus1,
+                                              usedChunkSize,
+                                              "numCoresMinus1_X_chunkSize");
+  auto chunkStepSizeTrunc = entryBuilder.CreateTrunc(
+      chunkStepSize,
+      step->getType()); // why? Might be just a typing thing but can you fuck
+                        // up the modulo with this?
+  auto chunkStep = entryBuilder.CreateMul(
+      chunkStepSizeTrunc,
+      step,
+      "chunkStep"); // Note that we shoved all this computation in the entry
+                    // block, so it only runs once
+
+  /
+   * Add the instructions for the calculation of the next chunk's start value
+   * in the loop's body.
+   /
+  IRBuilder<> loopBuilder(
+      taskLoopBlock); // recall that taskLoopBlock is the latch
+  loopBuilder.SetInsertPoint(
+      taskLoopBlock
+          ->getTerminator()); // So we're at the bottom of the iteration which
+                              // is why we're in the latch, and we have to be
+                              // there because we've gotta be before the
+                              // superstep into the next set of iterations.
+  auto chunkStepTrunc =
+      loopBuilder.CreateTrunc(chunkStep, taskLoopValue->getType());
+  auto nextChunkValueBeforeMod =
+      loopBuilder.CreateAdd(taskLoopValue,
+                            chunkStepTrunc,
+                            "nextChunkValueBeforeMod");
+  auto periodTrunc =
+      loopBuilder.CreateTrunc(period, taskLoopValue->getType());
+  auto nextChunkValue = loopBuilder.CreateSRem(
+      nextChunkValueBeforeMod,
+      periodTrunc,
+      "nextChunkValue"); // srem: signed division. Modulo stand-in. Should it
+                         // be UREM @simone?
+
+  /
+   * Determine if we have reached the end of the chunk, and choose the
+   * periodic variable's next value accordingly.
+   /
+  auto isChunkCompleted =
+      cast<SelectInst>(chunkPHI->getIncomingValueForBlock(taskLoopBlock))
+          ->getCondition(); // sure, literally build a select inst where
+                            // condition is "isChunkCompleted" and return is
+                            // nextChunkValue or the extant taskLoopValue
+  auto nextValue = loopBuilder.CreateSelect(
+      isChunkCompleted, // still inserting into the latch
+      nextChunkValue,
+      taskLoopValue,
+      "nextValue");
+  taskPHI->setIncomingValueForBlock(taskLoopBlock, nextValue);
+}
+
+/*
+ * The exit condition needs to be made non-strict to catch iterating past it
+ */
   auto loopGoverningIVAttr = allIVInfo->getLoopGoverningInductionVariable();
   LoopGoverningIVUtility ivUtility(loopSummary,
                                    *allIVInfo,
@@ -412,10 +511,14 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
    * Assert that any PHIs are invariant. Hoist one of those values (if
    * instructions) to the preheader.
    */
+  // DD: task 2: this can stay but I assume this should be like, a thing, kind
+  // of... independent of chunking strategy basically.
   auto exitConditionValue =
       this->fetchCloneInTask(task,
                              loopGoverningIVAttr->getExitConditionValue());
   assert(exitConditionValue != nullptr);
+
+  chunkSizeBuilder.SetInsertPoint(firstChunkSizeInst);
   if (auto exitConditionInst = dyn_cast<Instruction>(exitConditionValue)) {
     auto &derivation = ivUtility.getConditionValueDerivation();
     for (auto I : derivation) {
@@ -443,11 +546,11 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
       }
 
       cloneI->removeFromParent();
-      entryBuilder.Insert(cloneI); // move to entry
+      chunkSizeBuilder.Insert(cloneI); // move to entry
     }
 
     exitConditionInst->removeFromParent();
-    entryBuilder.Insert(exitConditionInst);
+    chunkSizeBuilder.Insert(exitConditionInst);
     // DD: overall this really just does what the parent comment says
   }
 
@@ -467,6 +570,8 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
    * branches that verify if the next iteration would ever occur. This still
    * requires live outs to be propagated from both the header and the latches
    */
+
+  // DD: why is this a temporary mitigation??? Does this even exist? What?
 
   /*
    * Identify any instructions in the header that are NOT sensitive to the
@@ -494,7 +599,8 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
   /*
    * Collect The PHI used to chunk iterations
    */
-  repeatableInstructions.insert(chunkPHI);
+  // Task 2: doesn't exist
+  // repeatableInstructions.insert(chunkPHI);
 
   /*
    * Collect Any PHIs of reducible variables by identifying all reducible SCCs
@@ -572,241 +678,265 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
       break;
     }
   }
-
   if (!requiresConditionBeforeEnteringHeader) {
+    return; // Task 2: don't put preheader guards.
+  }
+  /*  if (!requiresConditionBeforeEnteringHeader) {
 
-    /*
-     * We have to handle the special case where there are reducible SCCs (i.e.,
-     * reducable variables at the source code level) for which some of the
-     * non-PHI instructions are also contained in the header. For example,
-     * consider the following code:
-     *
-     * BB0:
-     *   ...
-     *   br %BB1
-     *
-     * BB1:
-     *  %v2 = PHI [%v1, BB1], [%v0, BB0]
-     *  ...
-     *  %v1 = add %v2, 1
-     *  ...
-     *  br %c %BB1, %BB2
-     *
-     * BB2:
-     *  return
-     *
-     *
-     * This is a special case because there are two values that we could use to
-     * store into the reduction variable:
-     * 1) the PHI instruction (e.g., %v2)
-     * 2) the non-PHI instruction that does the accumulation (e.g., %v1) We need
-     * to use the right value depending on whether the header would NOT have
-     * executed its last iteration. If that is the case, then we need to use the
-     * PHI instruction. Otherwise, if the last instance of the header was meant
-     * to be executed, then we need to use the non-PHI instruction.fd
-     *
-     * To solve this problem, we are going to inject a new SelectInst that
-     * checks whether the last execution of the header was meant to be executed.
-     * This SelectInst will be inserted into the basic block that leaves the
-     * task, just before storing the right value into the reduction variable of
-     * the current task.
-     */
-    auto env = LDI->getEnvironment();
-    auto envUser = this->envBuilder->getUser(0);
-    std::vector<std::pair<Instruction *, Instruction *>>
-        headerPHICloneAndProducerPairs;
-    for (auto envID : envUser->getEnvIDsOfLiveOutVars()) {
-
-      /*
-       * Fetch the clone of the producer of the current live-out variable.
-       * Fetch the header PHI of the live-out variable.
-       */
-      auto producer = cast<Instruction>(env->getProducer(envID));
-      assert(producer != nullptr);
-      auto scc = sccdag->sccOfValue(producer);
-      assert(scc != nullptr);
-      auto sccInfo = sccManager->getSCCAttrs(scc);
-      assert(sccInfo != nullptr);
-
-      /*
-       * Check if the current live-out variable is reducible
+      *
+       * We have to handle the special case where there are reducible SCCs
+    (i.e.,
+       * reducable variables at the source code level) for which some of the
+       * non-PHI instructions are also contained in the header. For example,
+       * consider the following code:
        *
-       * Live-out variables that are not reducible are handled separetely by
-       * "generateCodeToStoreLiveOutVariables"
-       */
-      if (!isa<ReductionSCC>(sccInfo)) {
-        continue;
-      }
-      auto reductionSCC = cast<ReductionSCC>(sccInfo);
+       * BB0:
+       *   ...
+       *   br %BB1
+       *
+       * BB1:
+       *  %v2 = PHI [%v1, BB1], [%v0, BB0]
+       *  ...
+       *  %v1 = add %v2, 1
+       *  ...
+       *  br %c %BB1, %BB2
+       *
+       * BB2:
+       *  return
+       *
+       *
+       * This is a special case because there are two values that we could use
+    to
+       * store into the reduction variable:
+       * 1) the PHI instruction (e.g., %v2)
+       * 2) the non-PHI instruction that does the accumulation (e.g., %v1) We
+    need
+       * to use the right value depending on whether the header would NOT have
+       * executed its last iteration. If that is the case, then we need to use
+    the
+       * PHI instruction. Otherwise, if the last instance of the header was
+    meant
+       * to be executed, then we need to use the non-PHI instruction.fd
+       *
+       * To solve this problem, we are going to inject a new SelectInst that
+       * checks whether the last execution of the header was meant to be
+    executed.
+       * This SelectInst will be inserted into the basic block that leaves the
+       * task, just before storing the right value into the reduction variable
+    of
+       * the current task.
+       *
+       //DD: really what this does is, it takes a special case of Nonrepeatable
+    World
+       //where we're allowed to hoist the checking of (iteration meant to be
+    executed)
+       //to after the loop completes.
+      auto env = LDI->getEnvironment();
+      auto envUser = this->envBuilder->getUser(0);
+      std::vector<std::pair<Instruction *, Instruction *>>
+          headerPHICloneAndProducerPairs;
+      for (auto envID : envUser->getEnvIDsOfLiveOutVars()) {
 
-      /*
-       * Check whether the header PHI is part of the set of PHIs we need to
-       * guard
-       */
-      auto headerPHI =
-          reductionSCC->getPhiThatAccumulatesValuesBetweenLoopIterations();
-      assert(headerPHI != nullptr);
-      auto clonePHI = task->getCloneOfOriginalInstruction(headerPHI);
-      assert(clonePHI != nullptr);
-      if (reducibleHeaderPHIsWithHeaderLogic.find(clonePHI)
-          != reducibleHeaderPHIsWithHeaderLogic.end()) {
-        headerPHICloneAndProducerPairs.push_back(
-            std::make_pair(clonePHI, producer));
+        *
+         * Fetch the clone of the producer of the current live-out variable.
+         * Fetch the header PHI of the live-out variable.
+         *
+        auto producer = cast<Instruction>(env->getProducer(envID));
+        assert(producer != nullptr);
+        auto scc = sccdag->sccOfValue(producer);
+        assert(scc != nullptr);
+        auto sccInfo = sccManager->getSCCAttrs(scc);
+        assert(sccInfo != nullptr);
+
+        *
+         * Check if the current live-out variable is reducible
+         *
+         * Live-out variables that are not reducible are handled separetely by
+         * "generateCodeToStoreLiveOutVariables"
+         *
+        if (!isa<ReductionSCC>(sccInfo)) {
+          continue;
+        }
+        auto reductionSCC = cast<ReductionSCC>(sccInfo);
+
+        *
+         * Check whether the header PHI is part of the set of PHIs we need to
+         * guard
+         *
+        auto headerPHI =
+            reductionSCC->getPhiThatAccumulatesValuesBetweenLoopIterations();
+        assert(headerPHI != nullptr);
+        auto clonePHI = task->getCloneOfOriginalInstruction(headerPHI);
+        assert(clonePHI != nullptr);
+        if (reducibleHeaderPHIsWithHeaderLogic.find(clonePHI)
+            != reducibleHeaderPHIsWithHeaderLogic.end()) {
+          headerPHICloneAndProducerPairs.push_back(
+              std::make_pair(clonePHI, producer));
+        }
       }
+
+      *
+       * Produce exit block SelectInst for all reducible SCCs that have header
+       * logic
+       *
+      if (headerPHICloneAndProducerPairs.size() > 0) {
+        auto startValue =
+            this->fetchCloneInTask(task, loopGoverningIV->getStartValue());
+
+        *
+         * If this comment gets its spacing normalized, it won't read right.
+         * Reminder: must use non-phi iff header was meant to execute its last
+         * iteration.
+         *
+         * Piece together the condition for all the SelectInst:
+         * ((prev loop-governing IV's value triggered exiting the loop) && (IV
+         * //DD: using "prev LGIV value" at any point is sacriledge. In this
+    case
+         * it seems to mean "n-1" but I intially took it to mean "n-chunkstep-1"
+         * header PHI != start value)) ? header phi // this will contain the
+         * pre-header value or the previous latch value : original producer
+    //this
+         * will be the live out value from the header
+         *
+        IRBuilder<> exitBuilder(
+            task->getLastBlock(0)->getFirstNonPHIOrDbgOrLifetime());
+        auto prevIterationValue =
+            ivUtility.generateCodeToComputeValueToUseForAnIterationAgo(
+                exitBuilder,
+                loopGoverningPHI,
+                stepSize);
+        auto headerToExitCmp = updatedCmpInst->clone();
+        headerToExitCmp->replaceUsesOfWith(
+            valueUsedToCompareAgainstExitConditionValue,
+            prevIterationValue);
+        exitBuilder.Insert(headerToExitCmp);
+        auto wasNotFirstIteration =
+            exitBuilder.CreateICmpNE(loopGoverningPHI, startValue);
+        auto skipLastHeader =
+            exitBuilder.CreateAnd(wasNotFirstIteration, headerToExitCmp);
+
+        *
+         * Use SelectInst created above to propagate the correct live out value
+         * for all reducible SCCs that have header logic
+         *
+        for (auto pair : headerPHICloneAndProducerPairs) {
+          auto headerPHIClone = pair.first;
+          auto producer = pair.second;
+          auto producerClone = task->getCloneOfOriginalInstruction(producer);
+          auto lastReducedInst =
+              cast<Instruction>(exitBuilder.CreateSelect(skipLastHeader,
+                                                         headerPHIClone,
+                                                         producerClone));
+
+          /
+           * HACK: Replace original producer clone entry with new SelectInst
+           * What would be cleaner is to invoke task->addLiveOut(producer,
+           * lastReducedInst) but this would require ParallelizationTechnique to
+           * support the possibility that its internal liveOutClones map could
+           * contain values with no equivalent in the original live out SCC.
+           * TODO: Update
+           * fetchOrCreatePHIForIntermediateProducerValueOfReducibleLiveOutVariable
+           * to support finding potentially newly created values that are
+    inserted
+           * into the liveOutClones map via the addLiveOut API
+           /
+          task->addInstruction(producer, lastReducedInst);
+        }
+      }
+
+      /
+       * There is no need for pre-header / latch guards, so we return
+       * TODO: Isolate reducible live out guards and pre-header / latch guards
+    to
+       * helper methods so this function's control flow is simpler
+       /
+      return;
     }
 
-    /*
-     * Produce exit block SelectInst for all reducible SCCs that have header
-     * logic
-     */
-    if (headerPHICloneAndProducerPairs.size() > 0) {
-      auto startValue =
-          this->fetchCloneInTask(task, loopGoverningIV->getStartValue());
+    /
+     * The new header includes instructions that should be executed only if we
+     * know that we didn't pass the last iteration. Hence, we need to add code
+    to
+     * check this condition before entering the header. Such code needs to be
+     * added for all predecessors of the header: pre-header and latches.
+     /
 
-      /*
-       * If this comment gets its spacing normalized, it won't read right.
-       * Reminder: must use non-phi iff header was meant to execute its last
-       * iteration.
+    /
+     * In each latch, check whether we passed the last iteration.
+     /
+    for (auto latch : loopSummary->getLatches()) {
+
+      /
+       * Fetch the latch in the loop within the task.
+       /
+      auto cloneLatch = task->getCloneOfOriginalBasicBlock(latch);
+
+      /
+       * Remove the old terminator because it will replace with the check.
+       /
+      auto latchTerminator = cloneLatch->getTerminator();
+      latchTerminator->eraseFromParent();
+      IRBuilder<> latchBuilder(cloneLatch);
+
+      /
+       * Fetch the value of the loop governing IV that would have been used to
+       * check whether the previous iteration was the last one. To do so, we
+    need
+       * to fetch the value of the loop-governing IV updated by the current
+       * iteration, which could be the IV value after updating it by adding the
+       * chunking size. So for example, if
+       * - the current core excuted the iterations 0, 1, and 2 and
+       * - the chunking size is 3 and
+       * - there are 2 cores, then
+       * at the end of the iteration 2 (i.e., at the latch) of core 0 the
+    updated
+       * loop-governing IV is 2 (the current value used in the compare
+       * instruction)
+       * + 1 (the normal IV increment)
+       * + 3 (the chunking size) * (2 - 1) (the other cores)
+       * ----
+       *   6
        *
-       * Piece together the condition for all the SelectInst:
-       * ((prev loop-governing IV's value triggered exiting the loop) && (IV
-       * //DD: using "prev LGIV value" at any point is sacriledge. In this case
-       * it seems to mean "n-1" but I intially took it to mean "n-chunkstep-1"
-       * header PHI != start value)) ? header phi // this will contain the
-       * pre-header value or the previous latch value : original producer //this
-       * will be the live out value from the header
-       */
-      IRBuilder<> exitBuilder(
-          task->getLastBlock(0)->getFirstNonPHIOrDbgOrLifetime());
+       * The problem is that we don't know if the header of the iteration 6
+    should
+       * be executed at all as the loop might have ended at an earlier iteration
+       * (e.g., 4). So we need to check whether the previous iteration (5 in the
+       * example) was actually executed. To this end, we need to compare the
+       * previous iteration IV value (e.g., 5) against the exit condition.
+       *
+       * Fetch the updated loop-governing IV (6 in the example above).
+       /
+      auto currentIVValue =
+          cast<PHINode>(loopGoverningPHI)->getIncomingValueForBlock(cloneLatch);
+
+      /
+       * Compute the value that this IV had at the iteration before (5 in the
+       * example above).
+       /
       auto prevIterationValue =
-          ivUtility.generateCodeToComputeValueToUseForAnIterationAgo(
-              exitBuilder,
-              loopGoverningPHI,
-              stepSize);
-      auto headerToExitCmp = updatedCmpInst->clone();
-      headerToExitCmp->replaceUsesOfWith(
+          ivUtility
+              .generateCodeToComputePreviousValueUsedToCompareAgainstExitConditionValue(
+                  latchBuilder,
+                  currentIVValue,
+                  stepSize);
+
+      /
+       * Compare the previous-iteration IV value against the exit condition
+       /
+      auto clonedCmpInst = updatedCmpInst->clone();
+      clonedCmpInst->replaceUsesOfWith(
           valueUsedToCompareAgainstExitConditionValue,
           prevIterationValue);
-      exitBuilder.Insert(headerToExitCmp);
-      auto wasNotFirstIteration =
-          exitBuilder.CreateICmpNE(loopGoverningPHI, startValue);
-      auto skipLastHeader =
-          exitBuilder.CreateAnd(wasNotFirstIteration, headerToExitCmp);
-
-      /*
-       * Use SelectInst created above to propagate the correct live out value
-       * for all reducible SCCs that have header logic
-       */
-      for (auto pair : headerPHICloneAndProducerPairs) {
-        auto headerPHIClone = pair.first;
-        auto producer = pair.second;
-        auto producerClone = task->getCloneOfOriginalInstruction(producer);
-        auto lastReducedInst =
-            cast<Instruction>(exitBuilder.CreateSelect(skipLastHeader,
-                                                       headerPHIClone,
-                                                       producerClone));
-
-        /*
-         * HACK: Replace original producer clone entry with new SelectInst
-         * What would be cleaner is to invoke task->addLiveOut(producer,
-         * lastReducedInst) but this would require ParallelizationTechnique to
-         * support the possibility that its internal liveOutClones map could
-         * contain values with no equivalent in the original live out SCC.
-         * TODO: Update
-         * fetchOrCreatePHIForIntermediateProducerValueOfReducibleLiveOutVariable
-         * to support finding potentially newly created values that are inserted
-         * into the liveOutClones map via the addLiveOut API
-         */
-        task->addInstruction(producer, lastReducedInst);
-      }
+      latchBuilder.Insert(clonedCmpInst);
+      latchBuilder.CreateCondBr(
+          clonedCmpInst,
+          task->getLastBlock(0),
+          headerClone); // the big lesson here is that if iteration n-1 is
+    final,
+                        // we can't execute the header again. But if n is the
+                        // final we MUST execute the header again.
     }
-
-    /*
-     * There is no need for pre-header / latch guards, so we return
-     * TODO: Isolate reducible live out guards and pre-header / latch guards to
-     * helper methods so this function's control flow is simpler
-     */
-    return;
-  }
-
-  /*
-   * The new header includes instructions that should be executed only if we
-   * know that we didn't pass the last iteration. Hence, we need to add code to
-   * check this condition before entering the header. Such code needs to be
-   * added for all predecessors of the header: pre-header and latches.
-   */
-
-  /*
-   * In each latch, check whether we passed the last iteration.
-   */
-  for (auto latch : loopSummary->getLatches()) {
-
-    /*
-     * Fetch the latch in the loop within the task.
-     */
-    auto cloneLatch = task->getCloneOfOriginalBasicBlock(latch);
-
-    /*
-     * Remove the old terminator because it will replace with the check.
-     */
-    auto latchTerminator = cloneLatch->getTerminator();
-    latchTerminator->eraseFromParent();
-    IRBuilder<> latchBuilder(cloneLatch);
-
-    /*
-     * Fetch the value of the loop governing IV that would have been used to
-     * check whether the previous iteration was the last one. To do so, we need
-     * to fetch the value of the loop-governing IV updated by the current
-     * iteration, which could be the IV value after updating it by adding the
-     * chunking size. So for example, if
-     * - the current core excuted the iterations 0, 1, and 2 and
-     * - the chunking size is 3 and
-     * - there are 2 cores, then
-     * at the end of the iteration 2 (i.e., at the latch) of core 0 the updated
-     * loop-governing IV is 2 (the current value used in the compare
-     * instruction)
-     * + 1 (the normal IV increment)
-     * + 3 (the chunking size) * (2 - 1) (the other cores)
-     * ----
-     *   6
-     *
-     * The problem is that we don't know if the header of the iteration 6 should
-     * be executed at all as the loop might have ended at an earlier iteration
-     * (e.g., 4). So we need to check whether the previous iteration (5 in the
-     * example) was actually executed. To this end, we need to compare the
-     * previous iteration IV value (e.g., 5) against the exit condition.
-     *
-     * Fetch the updated loop-governing IV (6 in the example above).
-     */
-    auto currentIVValue =
-        cast<PHINode>(loopGoverningPHI)->getIncomingValueForBlock(cloneLatch);
-
-    /*
-     * Compute the value that this IV had at the iteration before (5 in the
-     * example above).
-     */
-    auto prevIterationValue =
-        ivUtility
-            .generateCodeToComputePreviousValueUsedToCompareAgainstExitConditionValue(
-                latchBuilder,
-                currentIVValue,
-                stepSize);
-
-    /*
-     * Compare the previous-iteration IV value against the exit condition
-     */
-    auto clonedCmpInst = updatedCmpInst->clone();
-    clonedCmpInst->replaceUsesOfWith(
-        valueUsedToCompareAgainstExitConditionValue,
-        prevIterationValue);
-    latchBuilder.Insert(clonedCmpInst);
-    latchBuilder.CreateCondBr(
-        clonedCmpInst,
-        task->getLastBlock(0),
-        headerClone); // the big lesson here is that if iteration n-1 is final,
-                      // we can't execute the header again. But if n is the
-                      // final we MUST execute the header again.
-  }
+    */
 
   /*
    * In the preheader, assert that either the first iteration is being executed
@@ -825,7 +955,9 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
           offsetStartValue,
           stepSize);
 
-  auto clonedExitCmpInst = updatedCmpInst->clone();
+  // auto clonedExitCmpInst = updatedCmpInst->clone();cmpInst
+  // Task 2
+  auto clonedExitCmpInst = cmpInst->clone();
   clonedExitCmpInst->replaceUsesOfWith(
       valueUsedToCompareAgainstExitConditionValue,
       prevIterationValue);

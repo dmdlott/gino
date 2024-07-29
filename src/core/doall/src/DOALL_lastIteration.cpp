@@ -73,6 +73,9 @@ BasicBlock *DOALL::getBasicBlockExecutedOnlyByLastIterationBeforeExitingTask(
     /*
      * Generate the code to identify whether we have executed the last loop
      * iteration.
+     */
+
+    /*
      *
      * Step 0: create the IV utility for the loop governing IV.
      */
@@ -83,41 +86,75 @@ BasicBlock *DOALL::getBasicBlockExecutedOnlyByLastIterationBeforeExitingTask(
                                      *allIVInfo,
                                      *loopGoverningIVAttr);
 
-    /*
+    auto loopGoverningIV = loopGoverningIVAttr->getInductionVariable();
+    auto originalLoopGoverningPHI =
+        cast<PHINode>(task->getCloneOfOriginalInstruction(
+            loopGoverningIV->getLoopEntryPHI()));
+
+    auto originalCmpInst =
+        loopGoverningIVAttr
+            ->getHeaderCompareInstructionToComputeExitCondition();
+    auto cmpInst =
+        cast<CmpInst>(task->getCloneOfOriginalInstruction(originalCmpInst));
+    auto clonedCmpInst = cmpInst->clone();
+    auto origValueUsedToCompareAgainstExitConditionValue =
+        loopGoverningIVAttr->getValueToCompareAgainstExitConditionValue();
+    auto valueUsedToCompareAgainstExitConditionValue =
+        task->getCloneOfOriginalInstruction(
+            origValueUsedToCompareAgainstExitConditionValue);
+    assert(
+        cmpInst->getOperand(0) == valueUsedToCompareAgainstExitConditionValue
+        && "IV is not the first operand in the cloned compare instruction to compare against the exit condition value");
+    clonedCmpInst->replaceUsesOfWith(
+        valueUsedToCompareAgainstExitConditionValue,
+        originalLoopGoverningPHI);
+    lastBBBuilder.Insert(clonedCmpInst, "isLastLoopIteration");
+    lastBBBuilder.CreateCondBr(clonedCmpInst, newJoinBB, newBB);
+
+    return;
+    /* //Task 2
+
+    /
      * Step 1: find the value of the loop governing IV that was updated to
      * (potentially) skip to the next chunk.
-     */
+     /
     auto loopGoverningIV = loopGoverningIVAttr->getInductionVariable();
     auto originalLoopGoverningPHI =
         cast<PHINode>(task->getCloneOfOriginalInstruction(
             loopGoverningIV->getLoopEntryPHI()));
     auto &setOfLoopGoverningLastValues =
         this->IVValueJustBeforeEnteringBody.at(originalLoopGoverningPHI);
-    assert(setOfLoopGoverningLastValues.size() > 0);
-    auto valueOfLoopGoverningIVAfterConsideringChunking = // this ends up being
+    //Task2: not properly updated in DOALL_Chunking under Task2, causes issue
+    //assert(setOfLoopGoverningLastValues.size() > 0); //Task 2: absolutely not,
+    arguably for task 2 assert if != 0 auto
+    valueOfLoopGoverningIVAfterConsideringChunking = // this ends up being
                                                           // the select that we
                                                           // built that chooses
                                                           // chunkstepped IV or
                                                           // not, see
-                                                          // chunking:129
+                                                          // DOALL_Chunking
         *setOfLoopGoverningLastValues.begin();
     assert(valueOfLoopGoverningIVAfterConsideringChunking != nullptr);
 
-    /*
+    /
      * Step 2: find the value of the loop governing IV that was used to do the
      * last loop-condition check (whether to run the next iteration or not).
-     */
+     /
     auto loopGoverningIVLastValue = cast<Instruction>(this->fetchCloneInTask(
         task,
         loopGoverningIVAttr->getValueToCompareAgainstExitConditionValue()));
     assert(loopGoverningIVLastValue != nullptr);
     auto loopGoverningIVLastValueBB = loopGoverningIVLastValue->getParent();
 
-    /*
+    /
      * Step 3: add the PHI to merge the loop governing IV last value with its
      * value when the loop was exited directly side-stepping the basic block
      * that skip to the next chunk.
-     *
+     * //DD: this means, "build a phi that merges the LGIV between cases where
+    loop exit occurred due to the original exit condition vs due to logic
+    inserted by DOALL_Chunking"
+     * //DD: stupid design to have this be this way. Any time we add an exit we
+    should be handling this.
      * The loop governing IV value
      * @valueOfLoopGoverningIVAfterConsideringChunking is computed in the basic
      * block where all IVs are fast-forwarded to their value at the beginning of
@@ -125,10 +162,11 @@ BasicBlock *DOALL::getBasicBlockExecutedOnlyByLastIterationBeforeExitingTask(
      * left the loop. This is why we need to introduce @loopGoverningExitPHI and
      * @lastIterationPHI to determine where the value used in the exit condition
      * came from.
-     */
+     /
     auto firstNotPHI = bb.getFirstNonPHI();
     if (firstNotPHI != nullptr) {
-      lastBBBuilder.SetInsertPoint(firstNotPHI);
+      lastBBBuilder.SetInsertPoint(firstNotPHI); //DD: set an insert point in
+    the post-exit block
     }
     auto valueOfLoopGoverningIVAfterConsideringChunkingBB =
         valueOfLoopGoverningIVAfterConsideringChunking->getParent();
@@ -168,10 +206,10 @@ BasicBlock *DOALL::getBasicBlockExecutedOnlyByLastIterationBeforeExitingTask(
     }
     lastBBBuilder.SetInsertPoint(&bb);
 
-    /*
+    /
      * Step 4: Compute the value that the loop governing IV had when the task
      * left the loop.
-     */
+     /
     auto stepSize = clonedStepSizeMap.at(loopGoverningIV);
     auto prevIterationValue =
         ivUtility.generateCodeToDetermineLastIterationValue(
@@ -180,11 +218,11 @@ BasicBlock *DOALL::getBasicBlockExecutedOnlyByLastIterationBeforeExitingTask(
             lastIterationPHI,
             stepSize);
 
-    /*
+    /
      * Step 5: Add the conditional branch to jump to the new basic block.
      *         To this end, compare the previous-iteration IV value against the
      * exit condition.
-     */
+     /
     auto originalCmpInst =
         loopGoverningIVAttr
             ->getHeaderCompareInstructionToComputeExitCondition();
@@ -198,14 +236,15 @@ BasicBlock *DOALL::getBasicBlockExecutedOnlyByLastIterationBeforeExitingTask(
             origValueUsedToCompareAgainstExitConditionValue);
     assert(
         cmpInst->getOperand(0) == valueUsedToCompareAgainstExitConditionValue
-        && "IV is not the first operand in the cloned compare instruction to compare against the exit condition value");
+        && "IV is not the first operand in the cloned compare instruction to
+    compare against the exit condition value");
     clonedCmpInst->replaceUsesOfWith(
         valueUsedToCompareAgainstExitConditionValue,
         prevIterationValue);
     lastBBBuilder.Insert(clonedCmpInst, "isLastLoopIteration");
     lastBBBuilder.CreateCondBr(clonedCmpInst, newJoinBB, newBB);
 
-    return;
+    return;*/
   };
   auto cfgTransformer = this->noelle.getCFGTransformer();
   auto newBB = cfgTransformer.branchToANewBasicBlockAndBack(
