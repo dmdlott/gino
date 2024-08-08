@@ -391,9 +391,10 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
     auto taskPHI = cast<PHINode>(task->getCloneOfOriginalInstruction(
         phi)); // get the task's clone of the previous
 
-    unsigned entryBlock, loopBlock;
     // check which index of the phi is the entry block and which is the loop
     // block.
+    uint64_t entryBlock = 0;
+    uint64_t loopBlock = 0;
     if (phi->getIncomingValue(0) == initialValue) {
       entryBlock = 0;
       loopBlock = 1;
@@ -405,11 +406,14 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
     }
     auto taskLoopBlock = task->getCloneOfOriginalBasicBlock(
         phi->getIncomingBlock(loopBlock)); // latch.
+    assert(taskLoopBlock != nullptr);
     auto loopValue =
         phi->getIncomingValue(loopBlock); // the value assigned to phi if phi is
                                           // reached from inside loop
+    assert(isa<Instruction>(loopValue));
     auto taskLoopValue = task->getCloneOfOriginalInstruction(
         cast<Instruction>(loopValue)); // clone of previous
+    assert(taskLoopValue != nullptr);
 
     /*
      * Calculate the periodic variable's initial value for the task.
