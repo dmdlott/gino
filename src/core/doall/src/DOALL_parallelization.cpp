@@ -156,7 +156,7 @@ bool DOALL::apply(LoopContent *LDI, Heuristics *h) {
     auto producer = loopEnvironment->getProducer(id);
     if (producer->getNumUses()
         == 1) { //??? isn't this wrong DD??? @simone see describing comment,
-                //algorithm mismatches //this is an overconservativeness.
+                // algorithm mismatches //this is an overconservativeness.
       if (auto consumer = dyn_cast<PHINode>(*producer->user_begin())) {
         auto scc = sccManager->getSCCDAG()->sccOfValue(consumer);
         auto sccInfo = sccManager->getSCCAttrs(scc);
@@ -250,6 +250,11 @@ bool DOALL::apply(LoopContent *LDI, Heuristics *h) {
     errs() << "DOALL:  Rewired induction variables and reducible variables\n";
   }
 
+  if (this->verbose >= Verbosity::Maximal) {
+    doallTask->getTaskBody()->print(errs() << "DOALL:  after rewire:\n");
+    errs() << "\n";
+  }
+
   /*
    * Store final results to loop live-out variables. Note this occurs after
    * all other code is generated. Propagated PHIs through the generated
@@ -260,7 +265,13 @@ bool DOALL::apply(LoopContent *LDI, Heuristics *h) {
     errs() << "DOALL:  Stored live outs\n";
   }
 
-  /*
+  if (this->verbose >= Verbosity::Maximal) {
+    doallTask->getTaskBody()->print(errs()
+                                    << "DOALL:  after store liveouts:\n");
+    errs() << "\n";
+  }
+
+  /*%
    * Add code to invoke the parallelized loop.
    */
   this->invokeParallelizedLoop(LDI);

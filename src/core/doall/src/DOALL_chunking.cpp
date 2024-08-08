@@ -27,6 +27,7 @@
 #include "arcana/noelle/core/Utils.hpp"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Value.h"
 
 namespace arcana::gino {
@@ -103,12 +104,20 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
                                                   lgivStartClone,
                                                   "endMinusStart");
   firstChunkSizeInst = dyn_cast<Instruction>(endMinusStart);
-  auto N = chunkSizeBuilder.CreateSDiv(endMinusStart, stepOfLGIVForChunkSize);
+  // Let's do two things here. If the exit con is exclusive, subtract 1.
+  // If there's a remainder, add 1 to N?
+  auto N =
+      chunkSizeBuilder.CreateSDiv(endMinusStart, stepOfLGIVForChunkSize, "N");
   if (!firstChunkSizeInst) {
     firstChunkSizeInst = dyn_cast<Instruction>(N);
   }
-  // we have N, now, to get T we actually need to retrieve T from the arguments
-  // of the Task function, since we need T dynamically.
+  auto Nrem = chunkSizeBuilder.CreateSRem(endMinusStart,
+                                          stepOfLGIVForChunkSize,
+                                          "Nrem");
+  // auto Nremcmp = chunkSizeBuilder.CreateCmp(CmpInst::ICMP_EQ, Value *LHS,
+  // Value *RHS)
+  //  we have N, now, to get T we actually need to retrieve T from the arguments
+  //  of the Task function, since we need T dynamically.
   auto T = task->getTaskBody()->getArg(
       2); // this should be correct. See DOALL_linker.cpp
   Value *usedT;
@@ -123,26 +132,40 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
   // auto Ttrunc = entryBuilder.CreateTrunc(T, N->getType());
   auto NT = chunkSizeBuilder.CreateSDiv(
       N,
-      usedT); // what if there's a remainder? Yaeaaaaaaaaaaaa that's not ok
+      usedT,
+      "NoverT"); // what if there's a remainder? Yaeaaaaaaaaaaaa that's not ok
   if (!firstChunkSizeInst) {
     firstChunkSizeInst = dyn_cast<Instruction>(NT);
   }
   auto chunkSizeDD = chunkSizeBuilder.CreateAdd(
       NT,
-      ConstantInt::get(NT->getType(),
-                       1)); // prevents issue with N/T having a remainder.
+      ConstantInt::get(NT->getType(), 1),
+      "remainderFix"); // prevents issue with N/T having a remainder. KLUDGE!
+                       // should be 1, not 3, and adjustements made elsewhere
   if (!firstChunkSizeInst) {
     firstChunkSizeInst = dyn_cast<Instruction>(chunkSizeDD);
   }
   Value *usedChunkSize;
   if (chunkSizeDD->getType() != task->taskInstanceID->getType()) {
-    usedChunkSize =
-        chunkSizeBuilder.CreateZExt(chunkSizeDD,
-                                    task->taskInstanceID->getType());
+    usedChunkSize = chunkSizeBuilder.CreateZExt(chunkSizeDD,
+                                                task->taskInstanceID->getType(),
+                                                "usedChunkSize");
   } else {
     usedChunkSize = chunkSizeDD;
   }
   auto chunkCounterType = usedChunkSize->getType();
+  Value *stepSizeForEndValCalc;
+  if (usedChunkSize->getType() != stepOfLGIVForChunkSize->getType()) {
+    stepSizeForEndValCalc =
+        chunkSizeBuilder.CreateSExt(stepOfLGIVForChunkSize,
+                                    usedChunkSize->getType());
+  } else {
+    stepSizeForEndValCalc = stepOfLGIVForChunkSize;
+  }
+  auto chunkSizeXStepSize = chunkSizeBuilder.CreateMul(usedChunkSize,
+                                                       stepSizeForEndValCalc,
+                                                       "chunkSizeTimesStep");
+  // auto print = task->getTaskBody()->getParent()->getOrInsertFunction()
 
   /*
    * Generate PHI to track progress on the current chunk
@@ -210,6 +233,7 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
                                ivPHI,
                                startOfIV,
                                nthCoreOffset); // apply the previous
+    offsetStartValue->setName("offsetStartValue");
     ivPHI->setIncomingValueForBlock(
         preheaderClone,
         offsetStartValue); // alter the (clone of) loopEntryPhi to have the
@@ -220,18 +244,20 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
                ->getInductionVariable()) {
       if (offsetStartValue->getType() != usedChunkSize->getType()) {
         auto truncOffChunkSize =
-            entryBuilder.CreateTrunc(usedChunkSize,
+            entryBuilder.CreateTrunc(chunkSizeXStepSize,
                                      offsetStartValue->getType());
-        auto lgivEndValTemp = entryBuilder.CreateAdd(truncOffChunkSize,
-                                                     offsetStartValue,
-                                                     "lgivEndValTemp");
-        auto lgivEndValFin = entryBuilder.CreateSub(lgivEndValTemp,
-                                                    clonedStepSizeMap[ivInfo],
-                                                    "lgivEndValFin");
+        auto lgivEndValTemp =
+            entryBuilder.CreateAdd(truncOffChunkSize, // go ahead 1 chunksize
+                                   offsetStartValue,
+                                   "lgivEndValTemp");
+        auto lgivEndValFin =
+            entryBuilder.CreateSub(lgivEndValTemp, // step back 1 step
+                                   clonedStepSizeMap[ivInfo],
+                                   "lgivEndValFin");
         lgivEndVal = lgivEndValFin;
       } else {
-        auto lgivEndValTemp = entryBuilder.CreateAdd(offsetStartValue,
-                                                     usedChunkSize,
+        auto lgivEndValTemp = entryBuilder.CreateAdd(chunkSizeXStepSize,
+                                                     offsetStartValue,
                                                      "lgivEndValTemp");
         auto lgivEndValFin = entryBuilder.CreateSub(lgivEndValTemp,
                                                     clonedStepSizeMap[ivInfo],
@@ -679,7 +705,14 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
     }
   }
   if (!requiresConditionBeforeEnteringHeader) {
-    return; // Task 2: don't put preheader guards.
+    // Task 2 but also in general. Like... I'm convinced not doing this
+    // creates a race condition when we're in the only-repeatables world
+    // and don't have header guards. We seem to be able to spawn task threads
+    // that enter the loop header with an LGIV value beyond the end condition,
+    // and those instantly go to the block containing isLastLoopIteration,
+    // and they PASS THE COMPARE! THEY PASS THE COMPARE! THEY STORE AFTERWARDS!
+
+    // return; // Task 2: don't put preheader guards.
   }
   /*  if (!requiresConditionBeforeEnteringHeader) {
 
@@ -944,6 +977,7 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
    * check if this is the first iteration is if the IV condition is such that <=
    * 1 iteration would ever occur
    */
+
   auto preheaderTerminator = preheaderClone->getTerminator();
   preheaderTerminator->eraseFromParent();
   IRBuilder<> preheaderBuilder(preheaderClone);

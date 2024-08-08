@@ -109,7 +109,13 @@ BasicBlock *DOALL::getBasicBlockExecutedOnlyByLastIterationBeforeExitingTask(
         valueUsedToCompareAgainstExitConditionValue,
         originalLoopGoverningPHI);
     lastBBBuilder.Insert(clonedCmpInst, "isLastLoopIteration");
-    lastBBBuilder.CreateCondBr(clonedCmpInst, newJoinBB, newBB);
+    // Task 2: flip order here to change what is branched on true/false.
+    // in N/T we should branch to the last loop iteration block
+    //  when we meet or exceed the exit condition. Versus,
+    // in regular DOALL, we should branch when iteration n-1 DOES NOT
+    // meet/exceed the exit condition. lastBBBuilder.CreateCondBr(clonedCmpInst,
+    // newJoinBB, newBB);
+    lastBBBuilder.CreateCondBr(clonedCmpInst, newBB, newJoinBB); // Task 2
 
     return;
     /* //Task 2
