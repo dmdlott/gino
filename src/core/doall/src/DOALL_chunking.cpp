@@ -28,24 +28,53 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Value.h"
+#include <vector>
 
 namespace arcana::gino {
 
 void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
-  // what is a task?
-  // A task is a wrapper of a set of insts S orged in BBs cloned from orig code,
-  // wrapped in a new function f, with an env e that includes live-in and
-  // live-out vars of S f is called task body
-  //  a task has a static unique id, but you can instantiate multiple instances
-  //  of the same task & each will have its own dynamic instance id
-  // task: define and then invoke.
-  // step 1: define signature (via FunctionType::get) of f, f needs to obtain as
-  // inputs everything it needs to execute, ergo an instance of e must be an
-  // input of f return type of f is void always when you instantiate a new task
-  // the body is first defined by creating two BB, entry and exit. new BB are
-  // then created by cloning S, and you do this via Task::cloneAndAddBasicBlocks
-  // (or similar func)
+  // N/T chunking notes:
+  // We want to use N/T as a chunksize, where N is the number of loop iterations
+  // known dynamically at task entry, and T is the number of cores obtained for
+  // the task, known dynamically at task entry. In practice, we accept a
+  // chunksize that is at minimum N/T and at maximum floor(N/T)+1. We derive
+  // chunksize as N/T, and N as (end-start)/step + 1. Why the +1?
+  //(end-start)/step expresses the number of steps between the start value and
+  //(surpassing the) exit condition. However, there is always exactly one more
+  // iteration across the execution of a loop than steps performed during the
+  // execution. That is: iterations = total steps + 1. floor(
+  // floor((end-start)/step) /T) + 1 is the exact chunksize we use.
+  // floor((end-start)/step) is at least N-1. Then floor( (N-1) /T) is at least
+  // (N/T)-1 and at most (N/T). Then, N/T <= floor( floor((end-start)/step) /T)
+  // + 1 <= N/T + 1 N/T is always positive. Why? End is determined from the end
+  // con. Start is determined from the start value. Thus end-start may be
+  // positive or negative. However if start > end then stepsize is negative, and
+  // positive if vice versa (we don't handle integer overflow code). Therefore,
+  // N is always positive so N/T always positive.
+
+  // Exit conditions.
+  // The dynamic computation (end-start)/step produces N the dynamic number of
+  // iterations. However... LGIV is start at the t=0'th entry to the header.
+  // LGIV is start+step at the t=1'th entry to the header.
+  // Consider end-start = N * step. That's another equation that can express N,
+  // derived from (end-start)/step = N. Then end = start + N * step. start,
+  // start + step, 6-0 = 6. step 2. 3 steps. But we exit during the iteration of
+  // 6, there are 4 iterations run. Is it possible to screw things up with weird
+  // core/chunk relations due to +1 terms instead of remainder operations? What
+  // about preheader-header entry guards? Consider a loop that will have one
+  // step, two iterations, and 2 cores are obtained for it.
+
+  // RULE: this is doall so no loop-carried dependencies. Therefore, we win if
+  // we have that all iters are executed by some core once and no extra iters
+  // are executed. Change header entry guards to be "exit condition, but with
+  // exit condition value + step" -- that'll allow the "exit condition iter" to
+  // enter the loop if it's the first iter for some chunk.
+
+  // In terms of exit logic, we should execute
+  // code_executed_only_by_the_last_loop_iteration iff the exit condition is met
+  // by the current iter.
 
   /*
    * Fetch loop and IV information.
@@ -58,7 +87,6 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
   auto headerClone = task->getCloneOfOriginalBasicBlock(loopHeader);
   auto allIVInfo = LDI->getInductionVariableManager();
 
-  // Task 2
   /*
    * Collect clones of step size deriving values for all induction variables
    * of the parallelized loop. DD: that is to say, the value which represents
@@ -72,20 +100,12 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
       task->getEntry()->getTerminator(); // br from task-imposed entry block to
                                          // actual loop header
   chunkSizeBuilder.SetInsertPoint(jumpEntry);
-
   auto clonedStepSizeMap =
       this->cloneIVStepValueComputation(LDI, 0, chunkSizeBuilder);
-  // we need the original start val and end condition cmp val from the LGIV.
-  // IRBuilder<> entryBuilder(chunkComputationBB);
 
-  // entryBuilder.CreateBr(task->getEntry()->getUniqueSuccessor());
-  // task->getEntry()->getTerminator()->setSuccessor(0, chunkComputationBB);
-  // entryBuilder.SetInsertPoint(chunkComputationBB->getTerminator());
-  // chunkPHI->replaceIncomingBlockWith(task->getEntry(), chunkComputationBB);
-  // //deleteme
-
-  // we can change chunksize arg in here with those. We'll also need the number
-  // of dynamic task instances but can get that directly.
+  /*
+   * Get the end and start values for the LGIV to compute N/T
+   */
   auto lgivForChunkingVal = allIVInfo->getLoopGoverningInductionVariable();
   auto typeOfLGIV = lgivForChunkingVal->getInductionVariable()->getType();
   auto endConVal = lgivForChunkingVal->getExitConditionValue();
@@ -103,24 +123,36 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
   auto endMinusStart = chunkSizeBuilder.CreateSub(endConValClone,
                                                   lgivStartClone,
                                                   "endMinusStart");
-  firstChunkSizeInst = dyn_cast<Instruction>(endMinusStart);
-  // Let's do two things here. If the exit con is exclusive, subtract 1.
-  // If there's a remainder, add 1 to N?
-  auto N =
-      chunkSizeBuilder.CreateSDiv(endMinusStart, stepOfLGIVForChunkSize, "N");
+  std::vector<Value *> printVals1;
+  // printVals1.push_back(endConValClone);
+  // printVals1.push_back(lgivStartClone);
+  // printVals1.push_back(endMinusStart);
+  // printVals1.push_back(task->taskInstanceID);
+  // arcana::noelle::Utils::injectPrint(lgivStartClone, "%d\n",
+  // chunkSizeBuilder); arcana::noelle::Utils::injectPrint(printVals1, "end: %d,
+  // start: %d, endMinusStart: %d, TID: %lld\n", chunkSizeBuilder);
+
+  /*
+   * Compute chunksize as floor( floor((end-start)/step) /T) + 1, and assign
+   * that number to usedChunkSize. Floor operations are expressed implicitly in
+   * SDiv instrs.
+   */
+  firstChunkSizeInst = dyn_cast<Instruction>(
+      endMinusStart); // tracks where chunkSize computation begins, so we can
+                      // set IRBuilder insert location later
+  auto S = chunkSizeBuilder.CreateSDiv(endMinusStart,
+                                       stepOfLGIVForChunkSize,
+                                       "N"); //= floor((end-start) / step)
+  if (!firstChunkSizeInst) {
+    firstChunkSizeInst = dyn_cast<Instruction>(S);
+  }
+  auto N = chunkSizeBuilder.CreateAdd(S, ConstantInt::get(S->getType(), 1));
   if (!firstChunkSizeInst) {
     firstChunkSizeInst = dyn_cast<Instruction>(N);
   }
-  auto Nrem = chunkSizeBuilder.CreateSRem(endMinusStart,
-                                          stepOfLGIVForChunkSize,
-                                          "Nrem");
-  // auto Nremcmp = chunkSizeBuilder.CreateCmp(CmpInst::ICMP_EQ, Value *LHS,
-  // Value *RHS)
-  //  we have N, now, to get T we actually need to retrieve T from the arguments
-  //  of the Task function, since we need T dynamically.
   auto T = task->getTaskBody()->getArg(
-      2); // this should be correct. See DOALL_linker.cpp
-  Value *usedT;
+      2);       // this should be correct. See DOALL_linker.cpp
+  Value *usedT; // check if T requires trunc/ext
   if (T->getType() != typeOfLGIV) {
     usedT = chunkSizeBuilder.CreateTrunc(T, N->getType());
     if (!firstChunkSizeInst) {
@@ -129,23 +161,21 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
   } else {
     usedT = T;
   }
-  // auto Ttrunc = entryBuilder.CreateTrunc(T, N->getType());
   auto NT = chunkSizeBuilder.CreateSDiv(
       N,
       usedT,
-      "NoverT"); // what if there's a remainder? Yaeaaaaaaaaaaaa that's not ok
+      "NoverT"); //= floor( floor((end-start) / step) /T)
   if (!firstChunkSizeInst) {
     firstChunkSizeInst = dyn_cast<Instruction>(NT);
   }
   auto chunkSizeDD = chunkSizeBuilder.CreateAdd(
       NT,
       ConstantInt::get(NT->getType(), 1),
-      "remainderFix"); // prevents issue with N/T having a remainder. KLUDGE!
-                       // should be 1, not 3, and adjustements made elsewhere
+      "remainderFix"); //= floor( floor((end-start)/step) /T) + 1
   if (!firstChunkSizeInst) {
     firstChunkSizeInst = dyn_cast<Instruction>(chunkSizeDD);
   }
-  Value *usedChunkSize;
+  Value *usedChunkSize; // Value used for all chunksize computations later
   if (chunkSizeDD->getType() != task->taskInstanceID->getType()) {
     usedChunkSize = chunkSizeBuilder.CreateZExt(chunkSizeDD,
                                                 task->taskInstanceID->getType(),
@@ -153,8 +183,19 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
   } else {
     usedChunkSize = chunkSizeDD;
   }
+
+  std::vector<Value *> printVals;
+  // printVals.push_back(chunkSizeDD);
+  // printVals.push_back(N);
+  // printVals.push_back(usedT);
+  // printVals.push_back(stepOfLGIVForChunkSize);
+  // printVals.push_back(NT);
+  // printVals.push_back(task->taskInstanceID);
+
+  // arcana::noelle::Utils::injectPrint(printVals, "ChunkSizeDD: %d, N: %d,
+  // usedT: %d, stepOfLGIV: %d, NT: %d, TID: %lld\n", chunkSizeBuilder);
   auto chunkCounterType = usedChunkSize->getType();
-  Value *stepSizeForEndValCalc;
+  Value *stepSizeForEndValCalc; // Reconcile types between step and chunksize
   if (usedChunkSize->getType() != stepOfLGIVForChunkSize->getType()) {
     stepSizeForEndValCalc =
         chunkSizeBuilder.CreateSExt(stepOfLGIVForChunkSize,
@@ -165,6 +206,10 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
   auto chunkSizeXStepSize = chunkSizeBuilder.CreateMul(usedChunkSize,
                                                        stepSizeForEndValCalc,
                                                        "chunkSizeTimesStep");
+
+  // Below will need cleanup -- keeping code as comment is currently valuable
+  // for seeing what's been changed
+
   // auto print = task->getTaskBody()->getParent()->getOrInsertFunction()
 
   /*
@@ -217,10 +262,9 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
         loopEntryPHI)); // get the clone of the loopEntryPhi
 
     auto nthCoreOffset =
-        IVUtility::scaleInductionVariableStep( // inserts insts which calc the
-                                               // offset for core N of the start
-                                               // val basically per the opening
-                                               // comment of this section
+        IVUtility::scaleInductionVariableStep( // returns a multiply of step and
+                                               // arg #4 -- step * coreidx *
+                                               // chunksize
             preheaderClone,
             ivPHI,
             stepOfIV,
@@ -228,16 +272,19 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
                                    usedChunkSize,
                                    "coreIdx_X_chunkSize"));
 
-    auto offsetStartValue =
-        IVUtility::offsetIVPHI(preheaderClone,
-                               ivPHI,
-                               startOfIV,
-                               nthCoreOffset); // apply the previous
-    offsetStartValue->setName("offsetStartValue");
-    ivPHI->setIncomingValueForBlock(
+    auto offsetStartValue = IVUtility::offsetIVPHI(
         preheaderClone,
-        offsetStartValue); // alter the (clone of) loopEntryPhi to have the
-                           // correct start val for the task.
+        ivPHI,
+        startOfIV,
+        nthCoreOffset); // creates an add of startOfIV and nthCoreOffset,
+                        // matching type of ivPHI, without modifying ivPHI at
+                        // all.
+
+    offsetStartValue->setName("offsetStartValue");
+    ivPHI->setIncomingValueForBlock( // set the ivPHI to use offsetStartValue
+        preheaderClone,
+        offsetStartValue);
+
     // Task 2: we should calculate an lgiv end value based on each chunk.
     if (ivInfo
         == allIVInfo->getLoopGoverningInductionVariable()
@@ -246,10 +293,10 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
         auto truncOffChunkSize =
             entryBuilder.CreateTrunc(chunkSizeXStepSize,
                                      offsetStartValue->getType());
-        auto lgivEndValTemp =
-            entryBuilder.CreateAdd(truncOffChunkSize, // go ahead 1 chunksize
-                                   offsetStartValue,
-                                   "lgivEndValTemp");
+        auto lgivEndValTemp = entryBuilder.CreateAdd(
+            truncOffChunkSize, // go ahead 1 chunksize of steps
+            offsetStartValue,
+            "lgivEndValTemp");
         auto lgivEndValFin =
             entryBuilder.CreateSub(lgivEndValTemp, // step back 1 step
                                    clonedStepSizeMap[ivInfo],
@@ -264,6 +311,13 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
                                                     "lgivEndValFin");
         lgivEndVal = lgivEndValFin;
       }
+      std::vector<Value *> printVals2;
+      printVals2.push_back(offsetStartValue);
+      printVals2.push_back(lgivEndVal);
+      printVals2.push_back(task->taskInstanceID);
+
+      // arcana::noelle::Utils::injectPrint(printVals2, "offsetStartValue: %d,
+      // lgivEndVal: %d, TID: %lld\n", entryBuilder);
     }
   }
 
@@ -279,10 +333,25 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
     auto lgivPHI = allIVInfo->getLoopGoverningInductionVariable(*loopSummary)
                        ->getInductionVariable()
                        ->getLoopEntryPHI();
-    auto lgivPHIClone = this->fetchCloneInTask(task, lgivPHI);
+    auto lgivPHIClone = cast<PHINode>(this->fetchCloneInTask(task, lgivPHI));
+    // Task 2: to handle exit logics correctly, we need to record which lgiv
+    // value to use for each exiting block. For each block where we insert a
+    // chunkDoneCheck the correct value if the block's successor edge is the
+    // exit edge is the producer of the lgiv value for the next iteration.
+
+    for (auto i = 0u; i < lgivPHIClone->getNumIncomingValues(); ++i) {
+      auto B = lgivPHIClone->getIncomingBlock(i);
+      if (preheaderClone == B)
+        continue;
+
+      auto initialLatchValue = lgivPHIClone->getIncomingValue(i);
+      this->IVValueJustBeforeEnteringBody[lgivPHIClone].insert(
+          initialLatchValue);
+    }
+
     auto chunkDoneCheck = latchBuilder.CreateCmp(CmpInst::ICMP_EQ,
-                                                 lgivEndVal,
                                                  lgivPHIClone,
+                                                 lgivEndVal,
                                                  "chunkDoneCheck");
     latchBuilder.CreateCondBr(chunkDoneCheck,
                               task->getLastBlock(0),
@@ -1007,7 +1076,9 @@ void DOALL::rewireLoopToIterateChunks(LoopContent *LDI, DOALLTask *task) {
   auto isNotFirstIteration =
       preheaderBuilder.CreateICmpNE(offsetStartValue, startValue);
   preheaderBuilder.CreateCondBr(
-      preheaderBuilder.CreateAnd(isNotFirstIteration, clonedExitCmpInst),
+      preheaderBuilder.CreateAnd(isNotFirstIteration,
+                                 clonedExitCmpInst,
+                                 "notFirstIterAndPrevIterOk"),
       task->getExit(),
       headerClone);
 }

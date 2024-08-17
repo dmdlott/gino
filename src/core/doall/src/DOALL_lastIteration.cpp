@@ -21,6 +21,9 @@
  */
 #include "arcana/gino/core/DOALL.hpp"
 #include "arcana/gino/core/DOALLTask.hpp"
+#include "arcana/noelle/core/Utils.hpp"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 
 namespace arcana::gino {
 
@@ -90,7 +93,6 @@ BasicBlock *DOALL::getBasicBlockExecutedOnlyByLastIterationBeforeExitingTask(
     auto originalLoopGoverningPHI =
         cast<PHINode>(task->getCloneOfOriginalInstruction(
             loopGoverningIV->getLoopEntryPHI()));
-
     auto originalCmpInst =
         loopGoverningIVAttr
             ->getHeaderCompareInstructionToComputeExitCondition();
@@ -105,17 +107,23 @@ BasicBlock *DOALL::getBasicBlockExecutedOnlyByLastIterationBeforeExitingTask(
     assert(
         cmpInst->getOperand(0) == valueUsedToCompareAgainstExitConditionValue
         && "IV is not the first operand in the cloned compare instruction to compare against the exit condition value");
-    clonedCmpInst->replaceUsesOfWith(
+    /*clonedCmpInst->replaceUsesOfWith(
         valueUsedToCompareAgainstExitConditionValue,
-        originalLoopGoverningPHI);
+        exLogicPhi);*/ //DD: task 2
     lastBBBuilder.Insert(clonedCmpInst, "isLastLoopIteration");
-    // Task 2: flip order here to change what is branched on true/false.
-    // in N/T we should branch to the last loop iteration block
-    //  when we meet or exceed the exit condition. Versus,
-    // in regular DOALL, we should branch when iteration n-1 DOES NOT
-    // meet/exceed the exit condition. lastBBBuilder.CreateCondBr(clonedCmpInst,
-    // newJoinBB, newBB);
+    // arcana::noelle::Utils::injectPrint(valueUsedToCompareAgainstExitConditionValue,
+    // "%d", lastBBBuilder);//DD
+    //  Task 2: flip order here to change what is branched on true/false.
+    //  in N/T we should branch to the last loop iteration block
+    //   when we meet or exceed the exit condition. Versus,
+    //  in regular DOALL, we should branch when iteration n-1 DOES NOT
+    //  meet/exceed the exit condition.
+    //  lastBBBuilder.CreateCondBr(clonedCmpInst, newJoinBB, newBB);
     lastBBBuilder.CreateCondBr(clonedCmpInst, newBB, newJoinBB); // Task 2
+
+    // IRBuilder<> debugLastBBuilder(newBB);
+
+    // noelle::Utils::injectPrint("")
 
     return;
     /* //Task 2

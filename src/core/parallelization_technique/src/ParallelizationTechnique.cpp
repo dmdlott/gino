@@ -1121,12 +1121,21 @@ void ParallelizationTechnique::generateCodeToStoreLiveOutVariables(
             auto lastIterationBBTerminator = lastIterationBB->getTerminator();
             if (lastIterationBBTerminator != nullptr) {
               store->insertBefore(lastIterationBBTerminator);
+              // b.SetInsertPoint(lastIterationBBTerminator); //DD DELETEME
+              // arcana::noelle::Utils::injectPrint(producerValueToStore, "%p",
+              // b);//DD DELETEME
             } else {
               b.Insert(store);
+              // arcana::noelle::Utils::injectPrint(producerValueToStore, "%p",
+              // b);//DD DELETEME
             }
 
           } else {
             store->insertBefore(BB->getTerminator());
+            // IRBuilder<> b{ BB }; //DD DELETEME
+            // b.SetInsertPoint(BB->getTerminator()); //DD DELETEME
+            // arcana::noelle::Utils::injectPrint(producerValueToStore, "%p",
+            // b);//DD DELETEME
           }
         }
       }

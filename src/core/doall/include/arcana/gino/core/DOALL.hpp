@@ -55,7 +55,9 @@ protected:
   bool enabled;
   Function *taskDispatcher;
   Noelle &n;
-  std::map<PHINode *, std::set<Instruction *>> IVValueJustBeforeEnteringBody;
+  // std::map<PHINode *, std::set<Instruction *>> IVValueJustBeforeEnteringBody;
+  // //task 2
+  std::map<PHINode *, std::set<Value *>> IVValueJustBeforeEnteringBody;
 
   virtual void invokeParallelizedLoop(LoopContent *LDI);
 
